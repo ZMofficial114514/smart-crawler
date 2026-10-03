@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartcrawler"
+# 与 smartcrawler/__init__.py 的 __version__ 保持一致(那边是唯一来源)。改版本时两处都改, 并更新 CHANGELOG.md。
+version = "0.8.1"
+description = "Playwright + AI 的智能爬虫框架, 自带毛玻璃风格图形化控制台"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["crawler", "scraping", "playwright", "llm", "fastapi", "web-ui"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Framework :: FastAPI",
+  "Topic :: Internet :: WWW/HTTP",
+]
+
+dependencies = [
+  "playwright>=1.44",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "loguru>=0.7",
+  "httpx>=0.27",
+  "PyYAML>=6.0",
+  "python-dotenv>=1.0",
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.5", "pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+smartcrawler = "smartcrawler.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/SmartCrawler"
+
+[tool.setuptools]
+packages = ["smartcrawler", "smartcrawler.web", "smartcrawler.web.routes"]
+
+# 前端资源必须随包分发, 否则安装后 / 路由无内容可挂载
+[tool.setuptools.package-data]
+"smartcrawler.web" = ["frontend/**/*"]
+
+# ---------------------------------------------------------------------------
+# 工具配置
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = [".venv", "data", "logs", ".runtmp"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "E501",   # 行长由 formatter 处理,注释里的中文说明不强制折行
+  "B008",   # FastAPI 依赖注入惯用形参默认值
+  "RUF001", # 中文全角标点
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"smartcrawler/web/routes/*.py" = ["B008"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

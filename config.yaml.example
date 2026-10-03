@@ -1,0 +1,90 @@
+# ============================================================================
+# SmartCrawler YAML 配置示例
+# ----------------------------------------------------------------------------
+# 使用方式:
+#   Windows:  $env:SC_CONFIG_FILE = "config.yaml"; python -m smartcrawler web
+#   Linux/Mac: SC_CONFIG_FILE=config.yaml python -m smartcrawler web
+#
+# 优先级(从高到低): 真实环境变量 > .env > 本 YAML > 代码内默认值
+# 因此适合把"项目基线"写在 YAML, 把"个人密钥"留在 .env。
+#
+# 本文件列出的键与 Settings 模型一一对应; 完整可调项也可以在 Web 控制台的
+# 「系统配置」页里可视化编辑(那里会保存到 .env)。
+# ============================================================================
+
+# ---------- 浏览器 ----------
+browser:
+  engine: chromium            # chromium / firefox / webkit
+  headless: true              # 无头模式; 调试选择器时可设 false 观察
+  timeout: 30.0               # 页面导航超时(秒)
+  user_agent: ""              # 留空则按 anti_spider.rotate_user_agent 随机
+  viewport_width: 1366
+  viewport_height: 768
+  locale: zh-CN
+  timezone: Asia/Shanghai
+  max_pages: 4                # 同时打开的页面数上限(asyncio.Semaphore)
+  stealth: true               # 注入指纹伪装脚本
+  storage_state: ""           # 会话持久化文件, 如 data/session.json
+
+# ---------- 网络监听 ----------
+network:
+  capture_resource_types: [xhr, fetch, websocket]
+  max_body_size: 1000000      # 单响应体捕获上限(字节), 超出截断
+  body_capture_timeout: 10.0
+  dump_jsonl: false           # 把抓到的请求落盘
+  jsonl_path: data/network.jsonl
+  ws_capture_frames: true
+  max_records: 5000           # 内存中保留的记录数上限(防 OOM)
+
+# ---------- AI 辅助 ----------
+ai:
+  enabled: true
+  offline: false              # true = 纯规则引擎, 不发起任何 AI 调用
+  provider: openai            # openai(任意兼容接口) / ollama(本地)
+  base_url: https://api.deepseek.com    # 缺少 /v1 时会自动补全
+  model: deepseek-chat
+  # api_key 建议留在 .env 或环境变量里, 不要写进受版本控制的文件
+  temperature: 0.1
+  max_tokens: 2048            # 推理模型建议 >= 2048, 否则预算会被推理耗尽
+  timeout: 60.0
+  max_retries: 2
+  cache_enabled: true
+  cache_path: data/ai_cache.json
+
+# ---------- 反爬与合规 ----------
+anti_spider:
+  rotate_user_agent: true
+  random_delay_range: [1.0, 3.0]   # 每次导航前的随机限速区间(秒)
+  max_retries: 3
+  retry_backoff_base: 2.0
+  request_timeout: 30.0
+  proxies: []                 # 如 ["http://user:pass@host:port", "socks5://host:port"]
+  proxy_failure_cooldown: 300.0
+  respect_robots: true        # 强烈建议保持 true
+
+# ---------- 存储输出 ----------
+storage:
+  default_format: json        # json / jsonl / csv / sqlite
+  output_dir: data
+  sqlite_path: data/smartcrawler.db
+  sqlite_table: items
+  webhook_url: ""             # 抓取完成后 POST 结果
+
+# ---------- 抓取行为 ----------
+crawler:
+  max_depth: 1                # 分页抓取的最大页数
+  max_items: 500              # 单任务条数上限
+  network_settle: 2.5         # 页面加载后等待异步请求的时间(秒)
+  incremental: false
+  state_path: data/state.json
+  seen_hash_capacity: 20000
+
+# ---------- Web 控制台 / 调试接口 ----------
+api:
+  host: 127.0.0.1
+  port: 8322
+
+# ---------- 日志 ----------
+log_level: INFO
+log_file: logs/smartcrawler.log
+debug: false

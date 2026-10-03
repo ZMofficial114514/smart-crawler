@@ -1,0 +1,521 @@
+"""
+SmartCrawler 页面结构分析模块。
+
+StructureAnalyzer 在页面内执行一段分析 JS(单次 evaluate, 性能友好), 完成:
+1. 简化 DOM 树生成(剔除 script/style/注释, 带节点预算);
+2. 重复结构识别: 按"父容器 + 子元素签名(tag+稳定class)"分组, 找出疑似列表区,
+   并为每个候选列表项推断字段(标题/链接/图片/价格/其他叶子文本)及其相对选择器;
+3. 唯一 CSS 选择器生成: 优先 id > data-* > 稳定 class > nth-of-type 路径,
+   自动过滤框架生成的随机 class(css-xxx / 长十六进制哈希等);
+4. 分页器识别: "下一页/next/›" 等文本特征 + rel=next 兜底;
+5. 结构化元数据提取: JSON-LD / Open Graph / Microdata。
+
+产出 PageStructureReport(JSON), 既可直接落盘调试, 也是 AI 生成提取规则的核心输入。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from loguru import logger
+from playwright.async_api import Page
+
+from .config import Settings
+from .models import ExtractionRule, FieldSpec, ListCandidate, ListRule, PageStructureReport, PaginationInfo, PaginationRule
+from .utils import truncate
+
+# ---------------------------------------------------------------------------
+# 页面内执行的分析脚本(纯 JS, 无外部依赖)
+# 说明: 故意不使用 f-string, 避免花括号转义问题
+# ---------------------------------------------------------------------------
+_ANALYZE_JS = r"""
+() => {
+    const SKIP = {SCRIPT:1, STYLE:1, NOSCRIPT:1, TEMPLATE:1, SVG:1, PATH:1, LINK:1, META:1, IFRAME:1, CANVAS:1};
+    const cssEscape = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([^\w-])/g, '\\$1');
+    // 稳定 class: 过滤 CSS Modules / styled-components / 构建工具生成的随机类名
+    const stableClasses = (el) => Array.from(el.classList).filter(
+        c => c && !/^(css-|sc-|chakra-|jsx-|svelte-)/.test(c) && !/[a-f0-9]{10,}/i.test(c) && c.length <= 40
+    );
+
+    // ---- 唯一选择器生成: id > data-* > 稳定class > nth-of-type 路径 ----
+    const uniqSelector = (el) => {
+        if (!el || el === document.body) return 'body';
+        if (el.id) {
+            const sel = '#' + cssEscape(el.id);
+            if (document.querySelectorAll(sel).length === 1) return sel;
+        }
+        const tag = el.tagName.toLowerCase();
+        for (const attr of Array.from(el.attributes)) {
+            if (attr.name.startsWith('data-') && attr.value && attr.name !== 'data-v') {
+                const sel = tag + '[' + attr.name + '="' + attr.value.replace(/"/g, '\\"') + '"]';
+                if (document.querySelectorAll(sel).length === 1) return sel;
+            }
+        }
+        const cls = stableClasses(el);
+        if (cls.length) {
+            const sel = tag + '.' + cls.map(cssEscape).join('.');
+            if (document.querySelectorAll(sel).length === 1) return sel;
+        }
+        const parts = [];
+        let cur = el, depth = 0;
+        while (cur && cur.tagName && cur !== document.body && depth < 30) {
+            let s = cur.tagName.toLowerCase();
+            if (cur.id) { parts.unshift('#' + cssEscape(cur.id) + ' > ' + s); break; }
+            const parent = cur.parentElement;
+            if (parent) {
+                const sameTag = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                if (sameTag.length > 1) s += ':nth-of-type(' + (sameTag.indexOf(cur) + 1) + ')';
+            }
+            parts.unshift(s);
+            cur = parent; depth++;
+        }
+        return parts.length ? parts.join(' > ') : tag;
+    };
+
+    // ---- 相对 scope 的子选择器(用于列表项字段推断) ----
+    // 返回形如 "顶层tag.class 内层tag.class 最深层tag.class" 的后代选择器,
+    // 比"仅最近祖先层"更精准(如 article.product_pod p.price_color)
+    const tagClass = (el) => {
+        const cls = stableClasses(el);
+        return el.tagName.toLowerCase() + (cls.length ? '.' + cls.map(cssEscape).join('.') : '');
+    };
+    const relSelector = (scope, el) => {
+        const path = [];  // 从 el 向上到 scope 直接子节点之间的路径(不含顶层)
+        let cur = el;
+        for (let i = 0; i < 5 && cur && cur !== scope; i++) {
+            if (cur.parentElement === scope) {
+                const parts = [tagClass(cur)];
+                for (let j = Math.min(path.length, 2) - 1; j >= 0; j--) parts.push(tagClass(path[j]));
+                return parts.join(' ');
+            }
+            path.push(cur);
+            cur = cur.parentElement;
+        }
+        return null;
+    };
+
+    // ---- 从样本列表项推断字段 ----
+    const sampleFields = (sample) => {
+        const fields = [];
+        const used = new Set();
+        // 上限放宽到 12: 除了文本字段, 还要给 image / audio / video 留位置 ——
+        // 图片下载与音频下载插件都是按**字段名**取地址的, 规则里没有对应键就下不到东西。
+        const MAX_FIELDS = 12;
+        const push = (name, sel, attr) => {
+            if (!sel || fields.length >= MAX_FIELDS) return;
+            const key = sel + '|' + (attr || '');
+            if (used.has(key)) return;
+            used.add(key);
+            fields.push({ name: name, selector: sel, attribute: attr });
+        };
+
+        // ---- 图片 ----
+        // 优先 data-* 懒加载属性: 很多站点的 src 是占位图, 真地址在 data-src / data-original。
+        // 实测堆糖等图站: <img src="占位" data-src="真图"> —— 只取 src 会下到一堆占位图。
+        const LAZY_ATTRS = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-echo'];
+        const img = sample.querySelector('img');
+        if (img) {
+            const lazyAttr = LAZY_ATTRS.find(a => (img.getAttribute(a) || '').trim());
+            if (lazyAttr) {
+                push('image', relSelector(sample, img), lazyAttr);
+                if (fields.length < MAX_FIELDS) push('thumb', relSelector(sample, img), 'src');
+            } else if (img.getAttribute('src')) {
+                push('image', relSelector(sample, img), 'src');
+            }
+            // srcset 里通常是最高清的那张
+            const srcset = (img.getAttribute('srcset') || '').trim();
+            if (srcset && fields.length < MAX_FIELDS && !lazyAttr) {
+                push('image_srcset', relSelector(sample, img), 'srcset');
+            }
+        }
+        // 背景图(部分图站用 background-image)
+        if (!img) {
+            // 优先数据属性: 值就是干净的 URL, 不需要再解析 CSS
+            const BG_ATTRS = ['data-bg', 'data-background', 'data-bg-src', 'data-background-image'];
+            let done = false;
+            for (const a of BG_ATTRS) {
+                const el = sample.querySelector('[' + a + ']');
+                if (el && (el.getAttribute(a) || '').trim()) {
+                    push('image', relSelector(sample, el), a);
+                    done = true;
+                    break;
+                }
+            }
+            if (!done) {
+                for (const el of sample.querySelectorAll('*')) {
+                    if (fields.length >= MAX_FIELDS) break;
+                    const style = (el.getAttribute('style') || '');
+                    if (/background(-image)?\s*:\s*url\(/i.test(style)) {
+                        // style 属性带的是整段 CSS, 需要 "url" 变换把 url(...) 解出来
+                        push('image', relSelector(sample, el), 'style');
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- 音频 ----
+        const audio = sample.querySelector('audio[src], audio source[src], a[href$=".mp3" i], a[href$=".m4a" i], a[href$=".ogg" i], a[href$=".wav" i], a[href$=".flac" i]');
+        if (audio) {
+            const attr = audio.getAttribute('href') ? 'href' : 'src';
+            push('audio', relSelector(sample, audio), attr);
+        }
+        // ---- 视频(顺带, 同属媒体下载插件关心的字段) ----
+        const video = sample.querySelector('video[src], video source[src], a[href$=".mp4" i], a[href$=".webm" i]');
+        if (video) {
+            const attr = video.getAttribute('href') ? 'href' : 'src';
+            push('video', relSelector(sample, video), attr);
+        }
+
+        // 首个链接: 有文字 -> title(文本) + link(href); 无文字 -> 纯链接
+        const link = sample.querySelector('a[href]');
+        if (link) {
+            const sel = relSelector(sample, link);
+            const text = ((link.innerText || '')).trim();
+            if (sel && text) { push('title', sel, null); push('link', sel, 'href'); }
+            else if (sel) { push('link', sel, 'href'); }
+        }
+        // 价格类叶子文本
+        sample.querySelectorAll('*').forEach(el => {
+            if (fields.length >= MAX_FIELDS || el.childElementCount !== 0) return;
+            const t = ((el.innerText || '')).trim();
+            if (!t || t.length > 60) return;
+            if (/^[¥$€£]|￥|\d{1,3}(,\d{3})*(\.\d+)?\s*元|\d+\.\d{2}\b/.test(t)) {
+                push('price', relSelector(sample, el), null);
+            }
+        });
+        // 其余叶子文本
+        sample.querySelectorAll('*').forEach(el => {
+            if (fields.length >= MAX_FIELDS || el.childElementCount !== 0) return;
+            const t = ((el.innerText || '')).trim();
+            if (!t || t.length < 2 || t.length > 60) return;
+            const cls = stableClasses(el);
+            const tag = el.tagName.toLowerCase();
+            // 无 class 的裸标签给中性名(后续归一化: text -> title)
+            const name = cls.length ? cls[0] : (tag === 'a' ? 'text' : tag);
+            push(name, relSelector(sample, el), null);
+        });
+        return fields;
+    };
+
+    // ---- 重复结构识别 ----
+    const detectLists = () => {
+        const candidates = [];
+        const seen = new Set();
+        const containers = document.querySelectorAll('ul, ol, table tbody, div, section, main, article');
+        containers.forEach(parent => {
+            if (candidates.length >= 12) return;
+            // 认定"这是一个列表项"的条件(满足其一):
+            //   1. 自身文本够长(>10 字) —— 排除纯装饰性容器;
+            //   2. 含有链接或图片 —— 图库/商品墙这类条目的文字往往很短(甚至只有一个
+            //      缩略图 + 一行标题), 只按文本长度会把它们整片漏掉。
+            const children = Array.from(parent.children).filter(
+                c => !SKIP[c.tagName] && (
+                    ((c.innerText || '')).trim().length > 10 ||
+                    c.querySelector('a[href], img[src]')
+                )
+            );
+            if (children.length < 3) return;
+            const groups = new Map();
+            children.forEach(c => {
+                const sig = c.tagName + '|' + stableClasses(c).slice().sort().join('.');
+                if (!groups.has(sig)) groups.set(sig, []);
+                groups.get(sig).push(c);
+            });
+            for (const arr of groups.values()) {
+                if (arr.length < 3 || candidates.length >= 12) continue;
+                const tag = arr[0].tagName.toLowerCase();
+                const cls = stableClasses(arr[0]);
+                const parentSel = uniqSelector(parent);
+                let itemSel = null;
+                if (cls.length) {
+                    const cand = parentSel + ' > ' + tag + '.' + cls.map(cssEscape).join('.');
+                    if (document.querySelectorAll(cand).length >= arr.length) itemSel = cand;
+                }
+                if (!itemSel) itemSel = parentSel + ' > ' + tag;
+                const hits = document.querySelectorAll(itemSel).length;
+                if (hits < 3 || seen.has(itemSel)) continue;
+                seen.add(itemSel);
+                candidates.push({
+                    item_selector: itemSel,
+                    container_selector: parentSel,
+                    count: hits,
+                    sample_fields: sampleFields(arr[0]),
+                    sample_html: arr[0].outerHTML.slice(0, 2000)
+                });
+            }
+        });
+
+        // ---- 合并"同一个父容器下被拆开的几组" ----
+        // 瀑布流/多列布局里, 列表项的 class 会带上"列"的信息(duitang 就是
+        // `div.woo.co0/co1/co2`), 于是 24 张卡片被拆成 7/9/8 三组, 每组都被当成一个
+        // 独立列表 —— 最终规则只覆盖**一列**, 另外两列静默丢失。
+        //
+        // 判据: 同一个父容器下, 若干组元素互不重叠, 而它们的**并集**恰好能被一个
+        // 更宽的选择器选中 —— 那就说明它们本来就是一个列表, 合并之。
+        const mergeSplitGroups = (cands) => {
+            const byParent = new Map();
+            for (const c of cands) {
+                const key = c.container_selector || '';
+                if (!byParent.has(key)) byParent.set(key, []);
+                byParent.get(key).push(c);
+            }
+            const merged = [];
+            for (const [parentSel, group] of byParent) {
+                group.sort((a, b) => b.count - a.count);
+                const leader = group[0];
+                // 只有"最大的那组明显不是全部"时才值得合并(否则本来就没被拆)
+                const unionSize = group.reduce((s, c) => s + c.count, 0);
+                if (group.length < 2 || unionSize <= leader.count) {
+                    merged.push(...group);
+                    continue;
+                }
+                let parent = null;
+                try { parent = document.querySelector(parentSel); } catch (e) { parent = null; }
+                if (!parent) { merged.push(...group); continue; }
+
+                // 候选的"更宽选择器": 父级直接子元素里, 与各组同 tag 的那些
+                const tags = new Set();
+                try {
+                    for (const el of document.querySelectorAll(leader.item_selector)) tags.add(el.tagName.toLowerCase());
+                } catch (e) { /* 忽略 */ }
+                const tries = [];
+                if (parentSel) {
+                    for (const t of tags) tries.push(parentSel + ' > ' + t);
+                }
+                // 也试试"公共 class": 各组元素共享的那个 class 往往就是列表项的本质
+                const classCount = new Map();
+                for (const c of group) {
+                    try {
+                        for (const el of document.querySelectorAll(c.item_selector)) {
+                            for (const cl of stableClasses(el)) classCount.set(cl, (classCount.get(cl) || 0) + 1);
+                        }
+                    } catch (e) { /* 忽略 */ }
+                }
+                for (const [cl, n] of classCount) {
+                    if (n >= unionSize) {
+                        for (const t of tags) tries.push(t + '.' + cssEscape(cl));
+                    }
+                }
+                let picked = null;
+                for (const sel of tries) {
+                    let got;
+                    try { got = document.querySelectorAll(sel); } catch (e) { continue; }
+                    if (got.length === unionSize) { picked = { sel, got }; break; }
+                }
+                if (!picked) { merged.push(...group); continue; }
+
+                // 用并集里第一个元素的 selector 相对路径重新采字段
+                merged.push({
+                    item_selector: picked.sel,
+                    container_selector: parentSel,
+                    count: picked.got.length,
+                    sample_fields: sampleFields(picked.got[0]),
+                    sample_html: picked.got[0].outerHTML.slice(0, 2000)
+                });
+            }
+            return merged;
+        };
+
+        let finalCandidates = mergeSplitGroups(candidates);
+        finalCandidates.sort((a, b) => b.count - a.count);
+        return finalCandidates;
+    };
+
+    // ---- 分页识别 ----
+    const detectPagination = () => {
+        const pat = /(下一页|下页|后一页|next\s*page|^next$|›|»|>>)/i;
+        const prevPat = /(上一页|前一页|prev|‹|«)/i;
+        for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+            const t = ((el.innerText || el.textContent || '')).trim();
+            if (!t || t.length > 15 || !pat.test(t) || prevPat.test(t)) continue;
+            const a = el.tagName === 'A' ? el : el.closest('a');
+            if (a && a.href) {
+                return { next_selector: uniqSelector(a), next_text: t, next_href: a.href };
+            }
+        }
+        const rel = document.querySelector('a[rel="next"]');
+        if (rel && rel.href) {
+            return { next_selector: uniqSelector(rel), next_text: ((rel.innerText || '')).trim(), next_href: rel.href };
+        }
+        return null;
+    };
+
+    // ---- 结构化元数据 ----
+    const collectMetadata = () => {
+        const meta = { json_ld: [], open_graph: {}, microdata: [] };
+        document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+            try { meta.json_ld.push(JSON.parse(s.textContent)); } catch (e) { /* 忽略坏 JSON */ }
+        });
+        document.querySelectorAll('meta[property^="og:"], meta[name^="twitter:"]').forEach(m => {
+            const key = m.getAttribute('property') || m.getAttribute('name');
+            if (key) meta.open_graph[key] = m.getAttribute('content');
+        });
+        document.querySelectorAll('[itemprop]').forEach(el => {
+            if (meta.microdata.length >= 50) return;
+            const item = { itemprop: el.getAttribute('itemprop'), tag: el.tagName.toLowerCase() };
+            if (el.hasAttribute('content')) item.content = el.getAttribute('content');
+            else if (el.hasAttribute('href')) item.content = el.getAttribute('href');
+            else if (el.hasAttribute('src')) item.content = el.getAttribute('src');
+            else item.text = ((el.innerText || '')).trim().slice(0, 200);
+            meta.microdata.push(item);
+        });
+        return meta;
+    };
+
+    // ---- 简化 DOM 树 ----
+    const simplifiedTree = (maxDepth, maxNodes) => {
+        const lines = [];
+        let nodes = 0;
+        const walk = (el, depth, prefix) => {
+            if (depth > maxDepth || nodes > maxNodes) return;
+            if (SKIP[el.tagName]) return;
+            const tag = el.tagName.toLowerCase();
+            const id = el.id ? '#' + el.id : '';
+            const cls = stableClasses(el).slice(0, 3).map(c => '.' + c).join('');
+            let text = '';
+            if (!el.childElementCount) {
+                text = ' ' + ((el.innerText || el.textContent || '')).trim().slice(0, 60).replace(/\s+/g, ' ');
+            }
+            const href = (tag === 'a' && el.getAttribute('href')) ? ' -> ' + el.getAttribute('href').slice(0, 80) : '';
+            lines.push(prefix + tag + id + cls + text + href);
+            nodes++;
+            if (nodes > maxNodes) return;
+            Array.from(el.children).slice(0, 20).forEach(c => walk(c, depth + 1, prefix + '  '));
+        };
+        walk(document.body, 0, '');
+        return lines.join('\n');
+    };
+
+    const domStats = () => ({
+        total_elements: document.querySelectorAll('*').length,
+        links: document.querySelectorAll('a[href]').length,
+        images: document.querySelectorAll('img').length,
+        iframes: document.querySelectorAll('iframe').length,
+        forms: document.querySelectorAll('form').length
+    });
+
+    return {
+        title: document.title || '',
+        candidates: detectLists(),
+        pagination: detectPagination(),
+        metadata: collectMetadata(),
+        tree: simplifiedTree(10, 600),
+        dom_stats: domStats()
+    };
+};
+"""
+
+
+class StructureAnalyzer:
+    """页面结构分析器。"""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def analyze(self, page: Page) -> PageStructureReport:
+        """对当前页面执行结构分析, 返回结构报告。"""
+        url = page.url
+        try:
+            raw: dict[str, Any] = await page.evaluate(_ANALYZE_JS)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"页面结构分析失败 {url}: {exc}")
+            return PageStructureReport(url=url, title="")
+
+        candidates = [ListCandidate(**c) for c in raw.get("candidates", [])]
+        pag_raw = raw.get("pagination")
+        report = PageStructureReport(
+            url=url,
+            title=raw.get("title", ""),
+            simplified_tree=raw.get("tree", ""),
+            candidate_lists=candidates,
+            pagination=PaginationInfo(**pag_raw) if pag_raw else None,
+            metadata=raw.get("metadata", {}),
+            dom_stats=raw.get("dom_stats", {}),
+        )
+        logger.info(
+            f"结构分析完成: {truncate(url, 80)} | 候选列表 {len(candidates)} 个 "
+            f"| 分页 {'✓' if report.pagination else '✗'} | 节点 {report.dom_stats.get('total_elements', 0)}"
+        )
+        return report
+
+    # ------------------------------------------------------------------
+    # 规则引擎: 无 AI 时的降级方案
+    # ------------------------------------------------------------------
+    @staticmethod
+    def build_rule_from_structure(
+        report: PageStructureReport,
+        max_pages: int = 1,
+        field_limit: int = 8,
+    ) -> Optional[ExtractionRule]:
+        """根据结构报告生成默认提取规则(AI 不可用时的规则引擎降级方案)。
+
+        策略: 在"可推断字段 >= 2"的候选中综合评分:
+            score = 不同选择器数*4 + 字段数 + min(count, 20)
+        关键是"不同选择器数"的权重最高 —— 导航/侧边栏列表的各字段常来自同一元素
+        (如 title/link 都取自 <a>), 而真实数据列表(商品卡片)的字段来自不同元素。
+        """
+        best: Optional[ListCandidate] = None
+        best_score = -1.0
+        for cand in report.candidate_lists:
+            if len(cand.sample_fields) < 2:
+                continue
+            distinct = len({(f.get("selector"), f.get("attribute")) for f in cand.sample_fields})
+            score = distinct * 4 + len(cand.sample_fields) + min(cand.count, 20)
+            if score > best_score:
+                best, best_score = cand, score
+        if best is None:
+            logger.warning("规则引擎: 结构报告中没有可用的候选列表")
+            return None
+
+        fields: list[FieldSpec] = []
+        for f in best.sample_fields[:field_limit]:
+            name = _normalize_field_name(f.get("name", ""), f.get("attribute"))
+            fields.append(
+                FieldSpec(
+                    name=name,
+                    selector=f.get("selector", ""),
+                    attribute=f.get("attribute"),
+                    transform=_default_transforms(name, f.get("attribute")),
+                )
+            )
+        # 至少保证标题与链接存在
+        if not any(f.name == "link" for f in fields) and any(f.attribute == "href" for f in fields):
+            pass  # sample_fields 已含 link
+
+        rule = ExtractionRule(
+            mode="dom",
+            list_rule=ListRule(item_selector=best.item_selector, fields=fields),
+            source="rule",
+            notes=f"规则引擎生成(候选区 {best.container_selector}, 重复项 {best.count})",
+        )
+        if report.pagination and report.pagination.next_selector:
+            rule.pagination = PaginationRule(next_selector=report.pagination.next_selector, max_pages=max_pages)
+        return rule
+
+
+def _normalize_field_name(raw_name: str, attribute: Optional[str]) -> str:
+    """把推断出的字段名归一化为语义名。"""
+    name = (raw_name or "").strip().lower()
+    if attribute == "href" or any(k in name for k in ("link", "href", "url")):
+        return "link"
+    if any(k in name for k in ("price", "价", "amount")):
+        return "price"
+    if any(k in name for k in ("title", "name", "标题", "名称", "text")):
+        return "title"
+    if any(k in name for k in ("img", "image", "pic", "图")):
+        return "image"
+    # 非法字符清理, 保证可作为 dict key / CSV 列名
+    cleaned = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in name) or "field"
+    return cleaned
+
+
+def _default_transforms(name: str, attribute: Optional[str]) -> list[str]:
+    """按归一化字段名给出默认清洗管线(规则引擎降级时的启发式)。"""
+    if name == "price":
+        return ["price"]  # "£45.17" -> 45.17
+    if name in ("link", "image", "audio", "video") or (attribute or "").lower() in (
+        "src", "href", "data-src", "data-original", "data-bg", "srcset",
+    ):
+        return ["url"]  # 相对路径 -> 绝对 URL
+    return ["strip"]

@@ -1,0 +1,47 @@
+# ============================================================
+# SmartCrawler .gitignore
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+
+# ---------- 运行时产物 ----------
+data/
+logs/
+.runtmp/
+.piptmp/
+.browsers/
+*.log
+
+# ---------- 本地配置与密钥 ----------
+.env
+.env.local
+
+# ---------- 工具与编辑器 ----------
+.idea/
+.vscode/
+*.swp
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 登录会话等同于凭据, 绝不入库
+data/session.json
+data/sessions/
