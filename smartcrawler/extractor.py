@@ -86,12 +86,41 @@ class Extractor:
     # ------------------------------------------------------------------
     # DOM 提取
     # ------------------------------------------------------------------
-    async def extract_with_rule(self, page: Page, rule: ExtractionRule) -> list[dict[str, Any]]:
-        """在当前页面上按 dom 模式规则提取条目。"""
+    @staticmethod
+    def resolve_frame(page: Page, frame_name: str = "") -> Any:
+        """按名称取 frame; 取不到时回退到主文档。
+
+        存在的意义: 分析阶段可能是在某个同源 iframe 里完成的(外壳 + 内嵌 iframe 的站点),
+        提取必须落在**同一个** frame 上。否则分析与提取看的是两份不同的文档,
+        表现为"分析时识别出 150 条, 抓取却 0 条"。
+        """
+        if not frame_name:
+            return page
+        try:
+            for f in page.frames:
+                if (getattr(f, "name", "") or "") == frame_name:
+                    return f
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(f"未找到 frame {frame_name!r}, 回退到主文档提取")
+        return page
+
+    async def extract_with_rule(
+        self,
+        page: Page,
+        rule: ExtractionRule,
+        *,
+        frame_name: str = "",
+    ) -> list[dict[str, Any]]:
+        """在当前页面上按 dom 模式规则提取条目。
+
+        ``frame_name``: 内容所在 iframe 的名称(来自结构报告的 ``content_frame``)。
+        """
         if rule.mode != "json" and rule.list_rule:
             rule_data = rule.model_dump(mode="json")
+            target = self.resolve_frame(page, frame_name)
             try:
-                items = await page.evaluate(_EXTRACT_DOM_JS, rule_data)
+                items = await target.evaluate(_EXTRACT_DOM_JS, rule_data)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"DOM 提取失败: {type(exc).__name__}: {exc}")
                 return []

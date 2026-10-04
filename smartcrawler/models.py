@@ -122,6 +122,13 @@ class PageStructureReport(BaseModel):
         default=False,
         description="结构树是否因深度/节点上限被截断(界面据此显示『已截断』徽标)",
     )
+    #: 内容所在的 iframe 名称(空 = 主文档)。
+    #:
+    #: 部分站点采用"外壳 + 内嵌 iframe"结构: 主文档只有导航与播放条, 要抓的列表在内层
+    #: frame 里(网易云音乐即如此 —— 主文档 336 个元素、0 个候选列表; 内层 frame
+    #: 955 个元素、150 条歌曲记录)。分析器会下探到内容最丰富的同源 frame 并把名称记在
+    #: 这里, 提取时按同一 frame 取数, 否则分析与提取看的是两个不同的文档。
+    content_frame: str = Field(default="", description="内容所在的 iframe 名称, 空表示主文档")
     candidate_lists: list[ListCandidate] = Field(default_factory=list, description="候选列表区")
     pagination: Optional[PaginationInfo] = None
     metadata: dict[str, Any] = Field(

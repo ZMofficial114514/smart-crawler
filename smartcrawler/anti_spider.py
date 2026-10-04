@@ -99,7 +99,25 @@ STEALTH_JS = """
 
     // 4. 语言 / 插件 / 硬件特征
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+
+    // `navigator.plugins` **不覆盖**。
+    //
+    // 这里曾经写成 `get: () => [1, 2, 3, 4, 5]` —— 一个普通数组。它看着"有 5 个插件",
+    // 却丢掉了真实 PluginArray 的语义(索引访问返回 Plugin 对象、没有数组方法等)。
+    // 站点代码一旦按 PluginArray 使用就会抛异常。实测网易云音乐:
+    //     Cannot read properties of undefined (reading 'indexOf')
+    // 页面脚本整体中断, 搜索结果永远渲染不出来 —— 表现为"登录了也抓不到东西,
+    // 而且登录前后抓到的是同一个空外壳"。
+    //
+    // 逐段 A/B 测得(注入单段 vs 不注入, 看内层 frame 能否拿到 150 首歌):
+    //     webdriver / window.chrome / permissions / languages /
+    //     hardwareConcurrency / WebGL / canvas 噪声   全部安全(150 首, 0 报错)
+    //     plugins                                     0 首, 4 个 JS 报错
+    // 也就是说整份 stealth 脚本里只有这一行有害, 其余可保留。
+    //
+    // 无头 Chromium 的 plugins 本就是空 PluginArray(长度 0), 这与真实浏览器差别极小,
+    // 不值得为了"看起来有插件"而冒让页面脚本崩溃的风险。
+
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 
     // 5. WebGL 厂商/渲染器伪装

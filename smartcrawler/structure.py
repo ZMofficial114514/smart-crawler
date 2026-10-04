@@ -30,7 +30,15 @@ from .utils import truncate
 # ---------------------------------------------------------------------------
 _ANALYZE_JS = r"""
 () => {
-    const SKIP = {SCRIPT:1, STYLE:1, NOSCRIPT:1, TEMPLATE:1, SVG:1, PATH:1, LINK:1, META:1, IFRAME:1, CANVAS:1};
+    // 不参与结构树的标签。
+    //
+    // `TEXTAREA` / `INPUT` / `SELECT` / `OPTION` 的加入来自实测: 网易云音乐把
+    // ArtTemplate 的页面模板整段放在 `<textarea>` 里(如 `textarea#m-widget-comment3`),
+    // 而 `<textarea>` 的内容是 **raw text**, `innerText`/`textContent` 会原样返回那几百行
+    // JS(形如 `{if x.userType==4}${before}<sup class=...`)。结果简化树被这些模板代码
+    // 塞满, 既看不出真实结构, 又挤占了节点预算, 让真正的数据区进不来。
+    const SKIP = {SCRIPT:1, STYLE:1, NOSCRIPT:1, TEMPLATE:1, SVG:1, PATH:1, LINK:1,
+                  META:1, IFRAME:1, CANVAS:1, TEXTAREA:1, INPUT:1, SELECT:1, OPTION:1};
     const cssEscape = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([^\w-])/g, '\\$1');
     // 稳定 class: 过滤 CSS Modules / styled-components / 构建工具生成的随机类名
     const stableClasses = (el) => Array.from(el.classList).filter(
@@ -707,14 +715,124 @@ class StructureAnalyzer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def analyze(self, page: Page) -> PageStructureReport:
-        """对当前页面执行结构分析, 返回结构报告。"""
-        url = page.url
+    @staticmethod
+    async def _wait_for_frames_to_settle(
+        page: Page, *, timeout: float = 6.0, interval: float = 0.5, stable_rounds: int = 2
+    ) -> None:
+        """等各 frame 的元素总数稳定下来, 供 iframe 站点使用。
+
+        判据是"连续 ``stable_rounds`` 次采样总数不变"。只要有 frame 还在长(说明内容
+        仍在异步渲染), 就继续等, 最多 ``timeout`` 秒。
+
+        为什么不能只等主文档: 外壳页在 ``domcontentloaded`` 时就已 complete, 但内层
+        iframe 的内容是之后注入的。此时若立刻打分, 内层 frame 元素数很少, 会被判为
+        "没有内容", 于是选中外壳 —— 用户看到的正是"登录前后抓到的都是这个外壳页"。
+        """
+        import asyncio as _asyncio
+
+        probe = """() => {
+            const skip = (u) => !u || u.startsWith('about:') || u.startsWith('data:')
+                              || u.startsWith('blob:');
+            let total = 0;
+            for (const f of document.querySelectorAll('iframe')) {
+                // 同源可读的 iframe 才算(跨域读 contentDocument 会抛)
+                try {
+                    const d = f.contentDocument;
+                    if (d) total += d.querySelectorAll('*').length;
+                } catch (e) { /* 跨域, 忽略 */ }
+            }
+            return document.querySelectorAll('*').length + total;
+        }"""
         try:
-            raw: dict[str, Any] = await page.evaluate(_ANALYZE_JS)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"页面结构分析失败 {url}: {exc}")
+            last = -1
+            stable = 0
+            deadline = _asyncio.get_event_loop().time() + max(0.0, timeout)
+            while _asyncio.get_event_loop().time() < deadline:
+                try:
+                    total = int(await page.evaluate(probe))
+                except Exception:  # noqa: BLE001
+                    total = -1
+                if total == last and total > 0:
+                    stable += 1
+                    if stable >= stable_rounds:
+                        return
+                else:
+                    stable = 0
+                last = total
+                await _asyncio.sleep(interval)
+        except Exception as exc:  # noqa: BLE001 - 等待失败不该影响分析
+            logger.debug(f"等待 frame 稳定时出错(忽略): {exc}")
+
+    @staticmethod
+    def _accessible_frames(page: Page) -> list[Any]:
+        """返回可读的 frame 列表: 主文档在前, 其后是同源的子 frame。
+
+        跨域 frame 读 DOM 会抛异常, 直接跳过 —— 它们本来也抓不到。
+        `about:blank` 与 `data:` 之类的空 frame 一并跳过。
+        """
+        out: list[Any] = []
+        try:
+            frames = list(page.frames)
+        except Exception:  # noqa: BLE001
+            return out
+        for f in frames:
+            url = (getattr(f, "url", "") or "")
+            if url.startswith(("about:", "data:", "blob:")):
+                continue
+            out.append(f)
+        return out
+
+    async def analyze(self, page: Page) -> PageStructureReport:
+        """对当前页面执行结构分析, 返回结构报告。
+
+        **会下探到同源 iframe。** 部分站点(实测网易云音乐)采用"外壳 + 内嵌 iframe":
+        主文档只有导航与播放条, 目标列表全在内层 frame 里。只分析主文档的话,
+        候选列表是 0, 要么报"没有可提取的列表", 要么从外壳里提出一堆导航链接。
+        因此先分析主文档, 若没有候选列表, 再依次分析各同源子 frame, 取内容最丰富的那个,
+        并把 frame 名称记进报告, 供提取阶段使用同一个 frame。
+        """
+        url = page.url
+        # iframe 里的内容常常晚于主文档渲染完成(实测网易云音乐: 外壳 domcontentloaded
+        # 时内层 frame 还在导航, 元素数只有几十; 搜索结果是随后异步填进去的)。
+        # 若不等待就打分, 会选中"当时较大"的主文档, 于是又回到只看到外壳的老问题。
+        # 这里给一次重试窗口: 若各 frame 的元素总数还在增长, 就等一下再看。
+        await self._wait_for_frames_to_settle(page)
+
+        frames = self._accessible_frames(page)
+
+        best_frame: Any = None
+        best_raw: dict[str, Any] | None = None
+        best_name = ""
+        best_score: tuple[int, int, int] | None = None
+        main_raw: dict[str, Any] | None = None
+        for frame in frames:
+            try:
+                raw: dict[str, Any] = await frame.evaluate(_ANALYZE_JS)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"frame 分析失败({getattr(frame, 'url', '')[:60]}): {exc}")
+                continue
+            name = "" if frame is page.main_frame else (getattr(frame, "name", "") or "")
+            if frame is page.main_frame:
+                main_raw = raw
+            cands = raw.get("candidates") or []
+            stats = raw.get("dom_stats") or {}
+            # "内容更丰富"的判据: 先看候选列表数量, 再看元素数与图片数
+            score = (len(cands), int(stats.get("total_elements") or 0), int(stats.get("images") or 0))
+            if best_score is None or score > best_score:
+                best_frame, best_raw, best_name, best_score = frame, raw, name, score
+
+        if best_raw is None:
+            logger.error(f"页面结构分析失败 {url}: 所有 frame 都不可读")
             return PageStructureReport(url=url, title="")
+
+        raw = best_raw
+        frame_name = best_name
+        main_cands = len((main_raw or {}).get("candidates") or [])
+        if frame_name and len(raw.get("candidates") or []) > main_cands:
+            logger.info(
+                f"内容位于 iframe {frame_name!r}: "
+                f"主文档候选 {main_cands} 个 -> 该 frame {len(raw.get('candidates') or [])} 个"
+            )
 
         candidates = [ListCandidate(**c) for c in raw.get("candidates", [])]
         pag_raw = raw.get("pagination")
@@ -725,6 +843,7 @@ class StructureAnalyzer:
             title=raw.get("title", ""),
             simplified_tree=tree,
             simplified_tree_truncated=bool(raw.get("tree_truncated")),
+            content_frame=frame_name,
             candidate_lists=candidates,
             pagination=PaginationInfo(**pag_raw) if pag_raw else None,
             metadata=raw.get("metadata", {}),

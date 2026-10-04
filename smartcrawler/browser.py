@@ -322,11 +322,26 @@ class BrowserManager:
             return None
 
     async def wait_for_selector(
-        self, page: Page, selector: str, timeout: float = 10.0, state: str = "visible"
+        self,
+        page: Page,
+        selector: str,
+        timeout: float = 10.0,
+        state: str = "visible",
+        frame_name: str = "",
     ) -> Optional[ElementHandle]:
-        """等待选择器出现, 超时返回 None(不抛异常, 便于降级处理)。"""
+        """等待选择器出现, 超时返回 None(不抛异常, 便于降级处理)。
+
+        ``frame_name``: 在指定名称的 iframe 内等待。外壳 + 内嵌 iframe 的站点必须传,
+        否则等的是主文档 —— 那里没有目标元素, 只会一直等到超时。
+        """
+        scope: Any = page
+        if frame_name:
+            # 延迟导入避免循环依赖(extractor 已导入 browser 的类型)
+            from .extractor import Extractor
+
+            scope = Extractor.resolve_frame(page, frame_name)
         try:
-            return await page.wait_for_selector(selector, timeout=timeout * 1000, state=state)
+            return await scope.wait_for_selector(selector, timeout=timeout * 1000, state=state)
         except PlaywrightTimeoutError:
             logger.warning(f"等待选择器超时: {selector}")
             return None
@@ -344,9 +359,11 @@ class BrowserManager:
     # ------------------------------------------------------------------
     # 模拟用户行为
     # ------------------------------------------------------------------
-    async def click(self, page: Page, selector: str, timeout: float = 10.0) -> bool:
-        """点击元素(先等待可见)。"""
-        el = await self.wait_for_selector(page, selector, timeout=timeout)
+    async def click(
+        self, page: Page, selector: str, timeout: float = 10.0, frame_name: str = ""
+    ) -> bool:
+        """点击元素(先等待可见)。``frame_name`` 指定在哪个 iframe 内点击。"""
+        el = await self.wait_for_selector(page, selector, timeout=timeout, frame_name=frame_name)
         if el is None:
             return False
         try:

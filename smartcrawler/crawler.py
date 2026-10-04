@@ -430,9 +430,12 @@ class SmartCrawler:
 
                 # ---------- 7. 首页提取 ----------
                 await self.plugins.run_async("before_extract", ctx, only=plugin_ids)
+                # 内容可能在外壳页的同源 iframe 里(分析阶段已定位), 后续等待、提取、
+                # 翻页都要落在**同一个** frame 上, 否则两边看的是不同文档。
+                frame_name = report.content_frame or ""
                 # 先等选择器真的命中(SPA 在 network_settle 之后才渲染出列表的情况下,
                 # 直接提取会得到 0 条, 而用户完全不知道只是"还没渲染好")
-                if not await self._wait_for_items(page, rule):
+                if not await self._wait_for_items(page, rule, frame_name=frame_name):
                     logger.warning(
                         f"等待 {8.0}s 后 item_selector 仍未匹配到元素: "
                         f"{truncate(str(rule.list_rule.item_selector), 80)}"
@@ -443,12 +446,15 @@ class SmartCrawler:
                             "等待 8 秒后仍没有匹配到列表项 —— 可能是页面渲染更慢, "
                             "或规则与当前页面结构不符(可增大「额外等待」或重新分析)",
                         )
-                items = await self._extract_current(page, rule)
+                items = await self._extract_current(page, rule, frame_name=frame_name)
                 result.pages_crawled = 1
                 logger.info(f"第 1 页提取 {len(items)} 条")
 
                 # ---------- 8. 分页跟随 ----------
-                items = await self._follow_pagination(page, rule, items, max_pages, result, ctx, plugin_ids)
+                items = await self._follow_pagination(
+                    page, rule, items, max_pages, result, ctx, plugin_ids,
+                    frame_name=frame_name,
+                )
 
                 # ---------- 9. 去重 / 截断 / 增量 ----------
                 items = self.extractor.dedupe(items)
@@ -660,21 +666,28 @@ class SmartCrawler:
             )
         return issue
 
-    async def _extract_current(self, page, rule: ExtractionRule) -> list[dict[str, Any]]:
-        """按规则模式提取当前页面。"""
+    async def _extract_current(
+        self, page, rule: ExtractionRule, *, frame_name: str = ""
+    ) -> list[dict[str, Any]]:
+        """按规则模式提取当前页面。
+
+        ``frame_name`` 必须与结构分析所用的 frame 一致 —— 外壳 + 内嵌 iframe 的站点
+        里, 主文档根本没有列表, 落错 frame 会得到 0 条。
+        """
         if rule.mode == "json":
             items = self.extractor.extract_json_with_rule(self.recorder.records, rule)
             if not items and rule.source == "ai":
                 # AI 选了 json 模式但没匹配到: 尝试对最大 JSON 响应重新生成映射
                 items = await self._retry_json_with_ai(rule)
             return items
-        return await self.extractor.extract_with_rule(page, rule)
+        return await self.extractor.extract_with_rule(page, rule, frame_name=frame_name)
 
     async def _wait_for_items(
         self,
         page,
         rule: ExtractionRule,
         *,
+        frame_name: str = "",
         timeout: float = 8.0,
         interval: float = 0.4,
     ) -> bool:
@@ -688,15 +701,18 @@ class SmartCrawler:
 
         这里是**等事实**而不是等时长: 轮询 `item_selector` 是否已匹配到元素, 一旦匹配
         立刻返回(所以正常页面不会变慢), 直到超时才放弃并把结论交给上层。
+
+        ``frame_name``: 与结构分析同一个 frame(外壳 + 内嵌 iframe 的站点必需)。
         """
         if not rule.list_rule or not rule.list_rule.item_selector:
             return False
         selector = rule.list_rule.item_selector
+        target = self.extractor.resolve_frame(page, frame_name)
         deadline = time.monotonic() + max(0.0, timeout)
         first = True
         while True:
             try:
-                n = await page.evaluate(
+                n = await target.evaluate(
                     "(sel) => { try { return document.querySelectorAll(sel).length } "
                     "catch (e) { return -1 } }",
                     selector,
@@ -738,13 +754,20 @@ class SmartCrawler:
         result: TaskResult,
         ctx: Optional[PluginContext] = None,
         plugin_ids: Optional[list[str]] = None,
+        *,
+        frame_name: str = "",
     ) -> list[dict[str, Any]]:
-        """跟随"下一页"按钮翻页并合并各页数据(最多 max_pages 页)。"""
+        """跟随"下一页"按钮翻页并合并各页数据(最多 max_pages 页)。
+
+        ``frame_name``: 内容所在 frame。翻页按钮若在 frame 内, 点击与提取都要落在该 frame。
+        """
         pagination = rule.pagination
         if not pagination or not pagination.next_selector or max_pages <= 1:
             return items
         for page_no in range(2, max_pages + 1):
-            clicked = await self.browser.click(page, pagination.next_selector, timeout=8.0)
+            clicked = await self.browser.click(
+                page, pagination.next_selector, timeout=8.0, frame_name=frame_name
+            )
             if not clicked:
                 # 点击失败可能是最后一页(按钮禁用/消失), 正常结束
                 logger.info(f"第 {page_no - 1} 页为最后一页, 停止翻页")
@@ -755,7 +778,7 @@ class SmartCrawler:
             # 翻页后同样等"新内容真的到位"。SPA 翻页只是改 URL + 重渲染,
             # domcontentloaded 早就过了, 固定睡 2.5s 经常睡在骨架态上 ——
             # 那样提取到的还是旧内容, 去重后表现为"本页无新增"。
-            if not await self._wait_for_items(page, rule):
+            if not await self._wait_for_items(page, rule, frame_name=frame_name):
                 logger.warning(f"翻到第 {page_no} 页后仍未匹配到列表项, 仍尝试提取")
 
             # 插件: 每翻完一页(可在此对新页面做懒加载触发/注入)
@@ -765,7 +788,7 @@ class SmartCrawler:
                 ctx.page_no = page_no
                 await self.plugins.run_async("on_page", ctx, only=plugin_ids)
 
-            page_items = await self._extract_current(page, rule)
+            page_items = await self._extract_current(page, rule, frame_name=frame_name)
             before = len(items)
             items.extend(page_items)
             items = self.extractor.dedupe(items)
