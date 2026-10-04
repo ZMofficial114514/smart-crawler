@@ -47,6 +47,27 @@ _ANALYZE_JS = r"""
     const MAX_CLASSES_PER_SELECTOR = 3;
     const selectorClasses = (el) => stableClasses(el).slice(0, MAX_CLASSES_PER_SELECTOR);
 
+    // 长 URL 的省略方式: **在路径分隔符处截断, 并保留末尾的文件名**。
+    //
+    // 为什么不能直接 slice(0, N): 图片 URL 的关键信息在**文件名那一段**
+    // (作品 ID 与 _p0/_master1200 这类标记), 而冗余的是中间的日期目录。
+    // 早先树里给 URL 留 84 字符, pixiv 的 pximg 地址正常就超过这个长度, 于是显示成
+    //   https://i.pximg.net/c/250x250_80_a2/custom-thumb/img/2026/09/23/05/28/34/149997519_p
+    // 后半段被硬切成半个文件名, 既看不出是缩略图还是原图, 也没法直接对照。
+    // 现在: 头 96 + "…" + 尾 46, 且只在 '/' 处下刀, 保证不切碎路径片段。
+    const ellipsizeUrl = (u, max) => {
+        if (!u || u.length <= max) return u;
+        const headLen = Math.max(40, max - 52);
+        const tailLen = 46;
+        let head = u.slice(0, headLen);
+        const cut = head.lastIndexOf('/');
+        if (cut > 20) head = head.slice(0, cut);   // 回退到最近的 '/' 之后切断
+        let tail = u.slice(-tailLen);
+        const slash = tail.indexOf('/');
+        if (slash >= 0 && slash < tail.length - 1) tail = tail.slice(slash + 1);
+        return head + '/…/' + tail;
+    };
+
     // ---- 唯一选择器生成: id > data-* > 稳定class > nth-of-type 路径 ----
     const uniqSelector = (el) => {
         if (!el || el === document.body) return 'body';
@@ -350,20 +371,125 @@ _ANALYZE_JS = r"""
     };
 
     // ---- 分页识别 ----
+    // ---- 翻页检测 ----
+    //
+    // 三层策略, 从"最明确"到"最通用":
+    //
+    //   A) 文案: 下一页 / 次へ / next / › 等(多语言都要覆盖 —— 站点按 locale 渲染)
+    //   B) rel="next" 标准标记
+    //   C) **数字页码**: 当前页由 aria-current="true" 标记, 下一页 = 当前页 + 1
+    //
+    // 第 C 层是实测逼出来的: pixiv 搜索页的分页是一个 <nav>, 里面只有数字页码
+    // (1..7)与两个**没有文字**的箭头链接(靠 x 坐标区分上一页/下一页),
+    // 于是 A、B 都匹配不到 —— 报告里 pagination 直接是 None, 界面显示"未检测到下一页",
+    // 用户明明能看到翻页按钮。而数字页码是极常见的翻页形态(电商/论坛/图站),
+    // 而且它比文案更可靠: 文案会因语言/图标而缺失, 页码与 ?p= 参数则是结构性的。
     const detectPagination = () => {
-        const pat = /(下一页|下页|后一页|next\s*page|^next$|›|»|>>)/i;
-        const prevPat = /(上一页|前一页|prev|‹|«)/i;
-        for (const el of document.querySelectorAll('a, button, [role="button"]')) {
-            const t = ((el.innerText || el.textContent || '')).trim();
-            if (!t || t.length > 15 || !pat.test(t) || prevPat.test(t)) continue;
+        const visible = (el) => {
+            if (!el) return false;
+            const s = getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        };
+        const textOf = (el) => ((el.innerText || el.textContent || '')).trim();
+        const hrefOf = (el) => {
             const a = el.tagName === 'A' ? el : el.closest('a');
-            if (a && a.href) {
-                return { next_selector: uniqSelector(a), next_text: t, next_href: a.href };
+            return a ? (a.getAttribute('href') || '') : '';
+        };
+
+        // ---- A) 文案 ----
+        const pat = /(下一页|下页|后一页|次へ|次のページ|次ページ|もっと見る|続きを(見|読)む|next\s*page|^next$|older|›|»|>>|→)/i;
+        const prevPat = /(上一页|前一页|前一頁|前へ|prev|‹|«|←)/i;
+        for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+            if (!visible(el)) continue;
+            const t = textOf(el);
+            if (!t || t.length > 20 || !pat.test(t) || prevPat.test(t)) continue;
+            const href = hrefOf(el);
+            const target = href ? (el.tagName === 'A' ? el : el.closest('a')) : el;
+            return {
+                next_selector: uniqSelector(target),
+                next_text: t.slice(0, 20),
+                next_href: href,
+                strategy: 'text',
+            };
+        }
+
+        // ---- B) rel="next" ----
+        const rel = document.querySelector('a[rel="next"], link[rel="next"]');
+        if (rel) {
+            const href = rel.getAttribute('href') || '';
+            return {
+                next_selector: uniqSelector(rel.tagName === 'A' ? rel : rel),
+                next_text: textOf(rel).slice(0, 20),
+                next_href: href,
+                strategy: 'rel-next',
+            };
+        }
+
+        // ---- C) 数字页码 ----
+        // 找到"当前页"这个数字, 然后取"当前页 + 1"的链接。
+        // 当前页的判据(按可靠度): aria-current > 高亮 class(active/current/selected)
+        //                       > 无 href 的那个(很多分页把当前页渲染成不可点的 span)
+        const numericLinks = [];
+        for (const el of document.querySelectorAll('a[href], button, span, li')) {
+            const t = textOf(el);
+            if (!/^\d{1,4}$/.test(t)) continue;
+            if (!visible(el)) continue;
+            // 只要"页码容器"里的: 父/祖父里有 >= 3 个数字兄弟, 排除正文里的孤立数字
+            const box = el.parentElement;
+            if (!box) continue;
+            const sibs = [...box.children].filter(c => /^\d{1,4}$/.test(textOf(c)));
+            if (sibs.length < 3) continue;
+            const a = el.tagName === 'A' ? el : el.closest('a');
+            numericLinks.push({
+                el, a, n: parseInt(t, 10),
+                href: a ? (a.getAttribute('href') || '') : '',
+                current: el.getAttribute('aria-current') === 'true'
+                    || el.getAttribute('aria-current') === 'page'
+                    || /(^|[\s-])(active|current|selected|is-active)([\s-]|$)/i.test(
+                        (el.className || '').toString())
+                    || !a,
+            });
+        }
+        if (numericLinks.length >= 3) {
+            const cur = numericLinks.find(x => x.current) || numericLinks[0];
+            const next = numericLinks.find(x => x.n === cur.n + 1 && x.a && x.href)
+                || numericLinks.filter(x => x.a && x.href && x.n > cur.n)
+                    .sort((a, b) => a.n - b.n)[0];
+            if (next && next.a) {
+                return {
+                    next_selector: uniqSelector(next.a),
+                    next_text: String(next.n),
+                    next_href: next.href,
+                    strategy: 'numeric',
+                    current_page: cur.n,
+                };
             }
         }
-        const rel = document.querySelector('a[rel="next"]');
-        if (rel && rel.href) {
-            return { next_selector: uniqSelector(rel), next_text: ((rel.innerText || '')).trim(), next_href: rel.href };
+
+        // ---- D) 兜底: 明确的"页码 URL"链接里, 取 p 值最小的那个 ----
+        // 用于"当前页不是数字按钮"的站点(例如只有 上一页/下一页 两个链接但都没文字)。
+        const pageParam = /[?&](?:p|page|pg|pageno|pagenum)=(\d+)/i;
+        let best = null;
+        for (const a of document.querySelectorAll('a[href]')) {
+            const href = a.getAttribute('href') || '';
+            const m = pageParam.exec(href);
+            if (!m) continue;
+            const n = parseInt(m[1], 10);
+            const here = pageParam.exec(location.search);
+            const curN = here ? parseInt(here[1], 10) : 1;
+            if (n === curN + 1) {
+                // 正好是"当前页 + 1" —— 最强信号, 直接用
+                return {
+                    next_selector: uniqSelector(a),
+                    next_text: textOf(a).slice(0, 20) || String(n),
+                    next_href: href,
+                    strategy: 'page-param',
+                    current_page: curN,
+                };
+            }
+            if (visible(a) && (!best || n < best.n)) best = { a, href, n };
         }
         return null;
     };
@@ -486,10 +612,10 @@ _ANALYZE_JS = r"""
                 const LAZY = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-echo'];
                 const lazyAttr = LAZY.find(x => (el.getAttribute(x) || '').trim());
                 const u = lazyAttr ? el.getAttribute(lazyAttr) : (el.getAttribute('src') || el.getAttribute('srcset') || '');
-                if (u) media = (lazyAttr ? ' [' + lazyAttr + '] -> ' : ' -> ') + u.trim().split(/\s+/)[0].slice(0, 84);
+                if (u) media = (lazyAttr ? ' [' + lazyAttr + '] -> ' : ' -> ') + ellipsizeUrl(u.trim().split(/\s+/)[0], 150);
             } else if (tag === 'video' || tag === 'audio') {
                 const u = el.getAttribute('src') || '';
-                if (u) media = ' -> ' + u.slice(0, 84);
+                if (u) media = ' -> ' + ellipsizeUrl(u, 150);
             }
             lines.push(prefix + tag + id + cls + text + href + media);
             nodes++;
