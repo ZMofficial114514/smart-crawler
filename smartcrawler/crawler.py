@@ -183,8 +183,32 @@ _GENERATED_NAME_RE = re.compile(
 
 
 def looks_generated_name(name: str) -> bool:
-    """字段名是否是"构建产物"—— 无语义, 不该出现在用户看到的结果里。"""
-    return bool(name) and bool(_GENERATED_NAME_RE.match(name.strip()))
+    """字段名是否是"构建产物"—— 无语义, 不该出现在用户看到的结果里。
+
+    **要先归一化分隔符**: 同一个类名在结果里可能是 `s-fc7`(CSS 原形), 也可能是
+    `s_fc7`(被清洗管线/模型改写成下划线), 实测两种都出现过。只按连字符匹配会漏掉后者。
+    """
+    if not name:
+        return False
+    return bool(_GENERATED_NAME_RE.match(name.strip().replace("_", "-")))
+
+
+def _drop_generated_fields(rule: Any) -> None:
+    """从规则里移除名字是"构建产物"的字段(仅在还有其它字段可保留时)。
+
+    **必须保留至少一个字段**: 若某个页面所有字段名恰好都是构建产物(小站点可能出现),
+    全删掉会让规则变成空字段、什么都提取不到 —— 那比留下一个难看的列名更糟。
+    """
+    list_rule = getattr(rule, "list_rule", None)
+    fields = list(getattr(list_rule, "fields", None) or []) if list_rule else []
+    if len(fields) < 2:
+        return
+    keep = [f for f in fields if not looks_generated_name(str(getattr(f, "name", "") or ""))]
+    if not keep or len(keep) == len(fields):
+        return
+    dropped = [str(getattr(f, "name", "")) for f in fields if f not in keep]
+    list_rule.fields = keep
+    logger.info(f"移除无语义的字段列: {dropped}")
 
 
 def _field_attr(field: Any, key: str, default: Any = "") -> Any:
@@ -510,7 +534,23 @@ class SmartCrawler:
                         on_progress("WARNING", f"访问受限[{issue.issue_type}]: {issue.summary()}")
 
                 # ---------- 5. 结构分析 ----------
+                #
+                # 关于"降级页面"的说明(实测结论, 避免后人重复踩):
+                # 网易云在同一浏览器上下文访问多次后, 会开始返回**降级页** —— 内容 iframe 只
+                # 剩 43 个元素(正常 949)、列表始终不注入, 而重载页面救不回来; 新建上下文立刻
+                # 恢复。我一度在抓取流程里加了"检测到降级就 recycle_context() 重试", 实测**更糟**:
+                # 上下文一换, 当前 page 对象立刻失效, 后续日志与提取都会紊乱(出现过提取到外壳
+                # 导航 `发现音乐` 这种结果), 而且请求量翻倍会更快触发对方的降级。
+                # 因此这里只做**记录**, 不做自动重建 —— 让用户看到原因并自行重试, 比框架悄悄
+                # 折腾一遍再给出奇怪的半成品结果要好。恢复手段保留在 BrowserManager.recycle_context(),
+                # 供界面/调用方在明确需要时使用。
                 report = await self.structure.analyze(page)
+                if await self._page_looks_degraded(page):
+                    note = ("页面内容疑似未注入(存在空的同源 iframe) —— 若结果为空, "
+                            "通常是目标站点降级或限流所致, 稍后重试即可")
+                    logger.warning(note)
+                    if on_progress:
+                        on_progress("WARNING", note)
                 report.access_issue = issue if issue.detected else None
                 # 登录状态同样记进报告: 抓取时也需要知道"这份结构是匿名视图还是登录视图"
                 login = await detect_login_state(page, session_restored=self.browser.session_restored)
@@ -588,6 +628,14 @@ class SmartCrawler:
                 _merge_analyzed_fields(rule, report)
                 # 再验证每个字段是否真能取到值 —— 取不到的字段用分析结果里的选择器替换。
                 await self._validate_rule_fields(page, rule, report, frame_name=report.content_frame or "")
+                # 清理无语义列(s-fc7 / s_fc7 / td / css-1x2y3z)。
+                #
+                # 放在补齐之后: AI 自己带出来的(实测 5 次有 1 次)与补齐加进来的都要一起筛。
+                # **注意这里没有再跑一遍"重复列去重"**: 那需要再执行一次提取(多一次页面往返),
+                # 实测额外往返会明显加重目标站点的降级, 得不偿失。重复列在
+                # `_drop_duplicate_columns`(位于 _validate_rule_fields 内, 复用已有的提取结果)
+                # 里处理; 补齐新加进来的同义列由 `_merge_analyzed_fields` 按"选择器+属性"判重挡住。
+                _drop_generated_fields(rule)
 
                 # ---------- 7. 首页提取 ----------
                 await self.plugins.run_async("before_extract", ctx, only=plugin_ids)
@@ -949,33 +997,18 @@ class SmartCrawler:
 
         if replaced:
             logger.warning("字段选择器取不到值, 已用分析结果替换: " + "; ".join(replaced))
-            # 替换后再看一次, 只记录结论(不改动规则)
-            try:
-                rows2 = await target.evaluate(_EXTRACT_DOM_JS, rule.model_dump(mode="json"))
-                fixed = [str(getattr(f, "name", "")) for f in fields
-                         if any(str(r.get(str(getattr(f, "name", ""))) or "").strip() for r in rows2)]
-                logger.info(f"替换后能取到值的字段: {fixed}")
-            except Exception:  # noqa: BLE001
-                pass
 
-        # 去掉"取到的值完全一样"的重复列。
+        # 去掉"取到的值完全一样"的重复列, 复用上面已经取到的 rows(不再多跑一次提取)。
         #
         # 成因: AI 与分析器可能对同一列给出**略微不同**的选择器 —— AI 用
         # `div.td.w0 div.text a`(整个链接), 分析器用 `div.td.w0 div.sn span.s-fc7`
-        # (链接内的标题 span)。两者取到的文本一模一样, 选择器却不相等, 于是上面按
-        # 选择器判重的逻辑拦不住, 结果里就出现 song_name 与 title 两列相同的值。
-        # 判据用"所有行取值都相同", 比按选择器比对更贴近用户实际看到的东西。
-        try:
-            rows3 = await target.evaluate(_EXTRACT_DOM_JS, rule.model_dump(mode="json"))
-        except Exception:  # noqa: BLE001
-            return
-        if not rows3 or len(fields) < 2:
-            return
-        fingerprints: list[tuple[str, tuple[str, ...]]] = []
-        for f in fields:
-            fname = str(getattr(f, "name", "") or "")
-            vals = tuple(str(r.get(fname) or "") for r in rows3)
-            fingerprints.append((fname, vals))
+        # (链接内的标题 span)。取值一模一样而选择器不相等, 按选择器判重拦不住,
+        # 结果里就出现两列相同的值。判据用"所有行取值是否完全一致"。
+        fingerprints = [
+            (str(getattr(f, "name", "") or ""),
+             tuple(str(r.get(str(getattr(f, "name", "") or "")) or "") for r in rows))
+            for f in fields
+        ]
         drop: set[str] = set()
         for i in range(len(fingerprints)):
             ni, vi = fingerprints[i]
@@ -985,17 +1018,29 @@ class SmartCrawler:
                 nj, vj = fingerprints[j]
                 if nj in drop or vi != vj:
                     continue
-                # 值完全相同: 保留名字更像"主字段"的那个, 去掉另一个
-                # (长度更短、或命中常见主字段名者优先; 都不满足则保留先出现的)
-                prefer_first = ni.lower() in _PRIMARY_FIELD_NAMES
-                dropped = nj if prefer_first else ni
-                drop.add(dropped)
-                logger.info(f"字段 {dropped!r} 与 {ni if prefer_first else nj!r} 取值完全相同, 已去重")
-                if not prefer_first:
+                # 值完全相同: 保留"更像主字段"的那个名字
+                if ni.lower() in _PRIMARY_FIELD_NAMES or nj.lower() not in _PRIMARY_FIELD_NAMES:
+                    drop.add(nj)
+                    keep, gone = ni, nj
+                else:
+                    drop.add(ni)
+                    keep, gone = nj, ni
+                logger.info(f"字段 {gone!r} 与 {keep!r} 取值完全相同, 已去重")
+                if ni in drop:
                     break
         if drop:
             list_rule.fields = [f for f in list_rule.fields
                                 if str(getattr(f, "name", "") or "") not in drop]
+
+    async def _page_looks_degraded(self, page) -> bool:
+        """页面上是否存在"同源却几乎是空"的 iframe —— 内容没注入的信号。
+
+        这是"降级页面"最准的判据。实测网易云音乐降级时: 主文档 287 个元素(外壳正常)、
+        3 个候选(全是导航, 所以"有没有候选"区分不出来), 而内容 iframe 只有 **43** 个元素
+        (正常 949) —— 骨架在、数据不在, 接口还全是 HTTP 200。
+        复用结构分析器里同一套检查, 避免两处判据漂移。
+        """
+        return await self.structure._empty_iframe_exists(page)  # noqa: SLF001
 
     async def _validate_ai_pagination(
         self, page, rule: ExtractionRule, report, *, frame_name: str = ""

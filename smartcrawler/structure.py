@@ -831,24 +831,42 @@ class StructureAnalyzer:
 
     @staticmethod
     async def _empty_iframe_exists(page: Page) -> bool:
-        """页面上是否存在"同源却几乎是空"的 iframe。
+        """页面上是否存在"本该承载内容、却几乎是空"的 iframe。
 
-        用于识别"内层 frame 压根没加载"的情形。判据: 某个 iframe 的可读文档元素数 < 50。
-        跨域 iframe(读 contentDocument 抛异常)与不存在 contentDocument 的一律跳过 ——
-        它们本来就不该承载本站内容。
+        **判据必须收紧**, 否则会大面积误报 —— 实测网易云的正常页面上除了内容 frame
+        (`#g_iframe`, 949 个元素)之外, 还有一个它自己用的工具 iframe(3 个元素,
+        无 id 无 name)。若只看"同源且元素少", 这个 3 元素的垃圾 frame 就会让每个正常页面
+        都被判成"内容缺失", 不断触发重载。
+
+        所以要求同时满足:
+          - 有 ``name``(内容 frame 通常是命名的, 如 `contentFrame`), **或** 有明确的
+            同源 ``src`` 路径; 且
+          - 其 ``contentDocument`` 元素数 < 50。
+
+        无 name 且 src 为 `about:blank` 的一律跳过 —— 那是站点的临时/工具 frame, 不是内容位。
         """
         probe = """() => [...document.querySelectorAll('iframe')].map(f => {
+            let n = -1;
             try {
                 const d = f.contentDocument;
-                if (!d) return -1;
-                return d.querySelectorAll('*').length;
-            } catch (e) { return -2; }   // 跨域: 忽略
+                n = d ? d.querySelectorAll('*').length : -1;
+            } catch (e) { n = -2; }              // 跨域: 跳过
+            const src = f.getAttribute('src') || '';
+            const named = !!(f.getAttribute('name') || '').trim();
+            const realSrc = src && src !== 'about:blank';
+            return { n, named, realSrc };
         })"""
         try:
-            counts = await page.evaluate(probe)
+            infos = await page.evaluate(probe)
         except Exception:  # noqa: BLE001
             return False
-        return any(isinstance(c, int) and 0 <= c < 50 for c in (counts or []))
+        for i in infos or []:
+            n = i.get("n")
+            if not isinstance(n, int) or n < 0 or n >= 50:
+                continue
+            if i.get("named") or i.get("realSrc"):
+                return True
+        return False
 
     @staticmethod
     async def _incomplete_reason(
@@ -883,19 +901,8 @@ class StructureAnalyzer:
             return ""
 
         # --- B: 有 iframe 却几乎是空的 ---
-        probe = """() => [...document.querySelectorAll('iframe')].map(f => {
-            try {
-                const d = f.contentDocument;
-                return d ? d.querySelectorAll('*').length : -1;
-            } catch (e) { return -2; }   // 跨域: 忽略
-        })"""
-        try:
-            counts = await page.evaluate(probe)
-        except Exception:  # noqa: BLE001
-            return ""
-        empties = [c for c in (counts or []) if isinstance(c, int) and 0 <= c < 50]
-        if empties:
-            return f"页面上有 {len(empties)} 个同源 iframe 几乎是空的(元素数 {empties})"
+        if await StructureAnalyzer._empty_iframe_exists(page):
+            return "页面上有承载内容的同源 iframe 几乎是空的(内容疑似未注入)"
         return ""
 
     @staticmethod

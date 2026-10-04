@@ -98,6 +98,8 @@ class BrowserManager:
         self._browser = await engine.launch(**launch_kwargs)
 
         context_kwargs = await self._build_context_kwargs()
+        #: 记下建上下文用的参数, 供 recycle_context() 重建一个等价的新上下文
+        self._context_kwargs = context_kwargs
 
         # 会话恢复: 把 storage_state 直接交给 new_context —— Playwright 会同时注入
         # Cookie 与 localStorage, 比"先建上下文再 add_cookies + add_init_script"可靠得多。
@@ -131,6 +133,39 @@ class BrowserManager:
 
         self._started = True
         logger.info("浏览器启动完成")
+
+    async def recycle_context(self) -> bool:
+        """丢弃当前浏览器上下文并新建一个等价的, 返回是否成功。
+
+        **为什么需要**: 有些站点(实测网易云音乐)会在**同一个浏览器上下文累积了多次访问
+        之后**开始返回降级页面 —— 内容 iframe 只加载骨架(43 个元素), 而列表数据始终不注入,
+        接口也不报错(全是 HTTP 200)。此时**重新导航没有用**, 因为问题出在上下文这一层;
+        换一个全新的上下文立刻恢复(实测: 旧上下文 43 元素 / 0 首歌 -> 新上下文 949 元素 /
+        150 首歌, 连续 3 次稳定)。
+
+        实现上直接关掉旧上下文再建新的 —— 页面属于上下文, 会随之失效; 调用方需要重新导航。
+        """
+        if not self._started or self._browser is None:
+            return False
+        try:
+            if self._context is not None:
+                await self._context.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"关闭旧上下文时出错(忽略): {exc}")
+        self._pages = []
+        self._isolated_contexts = {}
+        try:
+            kwargs = dict(getattr(self, "_context_kwargs", {}) or {})
+            self._context = await self._browser.new_context(**kwargs)
+            if self.settings.browser.stealth:
+                await self._context.add_init_script(STEALTH_JS)
+            logger.info("已重建浏览器上下文(丢弃累积状态)")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"重建浏览器上下文失败: {type(exc).__name__}: {exc}")
+            self._context = None
+            self._started = False
+            return False
 
     async def _build_context_kwargs(self) -> dict:
         """构造浏览器上下文参数(UA/视口/语言/时区)。"""
