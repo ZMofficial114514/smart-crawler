@@ -124,7 +124,16 @@ async def main() -> int:
 
     site = Site()
     session_file = Path("data/session.json")
+    # ⚠️ 这个用例需要"从无会话开始", 但它操作的是**用户真实的** data/session.json。
+    # 一旦中途被 Ctrl+C / 超时打断, finally 里的还原就可能来不及执行, 用户的登录态
+    # 会被永久删掉 —— 实测发生过一次(pixiv 的会话就是这么丢的)。
+    # 所以这里额外落一份"保险副本": 崩溃/强杀后可以由用户或后续流程找回。
     backup = session_file.read_text(encoding="utf-8") if session_file.exists() else None
+    if backup is not None:
+        safe = Path(".runtmp/session_backup.json")
+        safe.parent.mkdir(parents=True, exist_ok=True)
+        safe.write_text(backup, encoding="utf-8")
+        print(f"  已把现有会话备份到 {safe}(防止本用例中断导致登录态丢失)")
     # **必须从"无会话"开始** —— 这正是用户的起点, 也是这个 bug 的必要条件
     session_file.unlink(missing_ok=True)
     print(f"靶站: {site.base}\n")
@@ -216,8 +225,11 @@ async def main() -> int:
 
     finally:
         site.stop()
+        # 还原用户原本的会话。**这一步的存在意义就是"验收不该有副作用"** ——
+        # 用例自己造出来的会话必须清掉, 用户原有的必须原样还回去。
         if backup is not None:
             session_file.write_text(backup, encoding="utf-8")
+            print("  已还原原有的登录会话")
         else:
             session_file.unlink(missing_ok=True)
 
