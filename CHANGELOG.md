@@ -17,6 +17,13 @@
 
 > 各版本要点。技术细节见下方条目。
 
+### v1.1.0
+
+- 支持「外壳 + 内嵌 iframe」站点: 自动下探到内容所在的同源 frame 并在该 frame 上提取
+  (网易云音乐搜索页此前只能抓到外层外壳, 现可正常取得歌曲列表)。
+- 修正 stealth 脚本覆盖 `navigator.plugins` 导致页面脚本中断的问题
+  (该问题会让部分站点登录后依然抓不到内容)。
+
 ### v1.0.3
 
 - 修复翻页失效: `next_selector` 丢失中间层级, 选择器匹配 0 个元素, 点击始终超时。
@@ -51,6 +58,67 @@
 - 多实例清理范围限定为自身进程链 (原会终止其他实例的浏览器)。
 - 浏览器失效时自动重建并重试。
 - 新增推送前密钥检查。
+
+## [1.1.0] — 2026-10-04
+
+新增对「外壳 + 内嵌 iframe」站点的支持, 并修正 stealth 脚本破坏页面脚本的问题。
+
+### 1. 支持内嵌 iframe 的内容(新增能力)
+
+部分站点主文档只是外壳, 目标内容在同源 iframe 里。网易云音乐搜索页即如此:
+
+| frame | 元素数 | 歌曲记录(`data-res-id`) | 内容 |
+|---|---|---|---|
+| 主 frame | 336 | 0 | 只有顶部导航与底部播放条 |
+| 子 frame (`#g_iframe`) | 955 | 150 | 搜索结果列表 |
+
+原实现只在主文档上执行分析 JS, 从不读取 `contentDocument`, 因此拿到的永远是外壳。
+
+- `StructureAnalyzer` 现遍历同源 frame(跳过 `about:` / `data:` / `blob:`), 各执行一次分析,
+  取「候选列表数 > 元素数 > 图片数」最大者, 并把 frame 名写入报告的新字段 `content_frame`;
+- iframe 内容常晚于主文档渲染完成, 新增 `_wait_for_frames_to_settle()`: 轮询各 frame 的
+  元素总数, 连续两次不变才认为稳定。不做这一步会选中当时较大、但实际尚未填充内容的主文档;
+- 提取侧贯通 `frame_name`: `Extractor.extract_with_rule`、`BrowserManager.click`、
+  `wait_for_selector`、`crawler._wait_for_items` / `_extract_current` / `_follow_pagination`
+  均支持指定 frame, 保证分析与提取落在同一个文档上。
+
+实测: `content_frame='contentFrame'`, 候选为 `div.srchsongst > div.item.f-cb.h-flag`(30 项),
+提取到 30 条歌曲记录, 字段 `song_name` / `link` / `album_name` / `duration`。
+
+### 2. `STEALTH_JS` 覆盖 `navigator.plugins` 导致页面脚本中断
+
+原实现为 `Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] })`,
+返回普通数组, 不具备真实 `PluginArray` 的语义。站点代码按 `PluginArray` 使用时抛异常。
+网易云音乐因此报 `Cannot read properties of undefined (reading 'indexOf')`, 页面脚本整体中断,
+搜索结果无法渲染 —— 表现为登录之后同样抓不到, 且登录前后得到的都是同一个空外壳。
+
+逐段 A/B(每次只注入一段, 观察内层 frame 能否取到 150 首歌曲):
+
+| 片段 | 歌曲数 | JS 报错 |
+|---|---|---|
+| webdriver / window.chrome / permissions / languages / hardwareConcurrency / WebGL / canvas 噪声 | 150 | 0 |
+| **plugins** | **0** | **4** |
+
+即整份脚本中只有这一行有害。现不再覆盖 `plugins` —— 无头 Chromium 本身就是空
+`PluginArray`, 与真实浏览器差别很小, 不值得为「看起来有插件」而让页面脚本崩溃。
+其余 7 段保留。
+
+### 3. 简化 DOM 树跳过表单控件
+
+`SKIP` 集合加入 `TEXTAREA` / `INPUT` / `SELECT` / `OPTION`。网易云把 ArtTemplate 模板整段
+放在 `<textarea>` 中, 而 textarea 的内容是 raw text, `innerText` 会原样返回数百行 JS
+(形如 `{if x.userType==4}${before}<sup class=...`), 既看不出真实结构, 又挤占节点预算,
+使数据区无法进入树。实测修复后模板残留 0 处。
+
+### 验收
+
+- 新增 `scripts/verify_iframe_descent.py`(iframe 下探 + 模板残留检查)、
+  `scripts/verify_netease_crawl.py`(端到端提取歌曲数据)。
+- 回归: 端到端通过、瀑布流 6/6、媒体字段 10/10、下载数量 4/4、URL 归类 21/21、
+  访问诊断 46/46、洛谷 16/16、插件通过、树正文覆盖通过、分页与 URL 通过、
+  懒加载 11/11、登录浮层 8/8、交互式续滚 8/8、人机验证 22/22、UI 沙箱 34/34、
+  布局通过、UI 诊断卡 24/24、登录检测双向通过、登录态重分析 18/18、5xx 误报通过、
+  插件文档 111/111、单元测试 14 项通过。
 
 ## [1.0.3] — 2026-10-04
 

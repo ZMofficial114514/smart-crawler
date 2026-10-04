@@ -54,11 +54,20 @@ async def main() -> int:
             print(f"    {json.dumps(r, ensure_ascii=False)[:150]}")
 
         songs = [r for r in rows if "/song" in json.dumps(r, ensure_ascii=False)]
-        titles = [r.get("title") for r in rows if r.get("title")]
+        # 字段名由规则推断决定, 不一定会叫 title —— 实测网易云生成的是 song_name。
+        # 断言要按"有没有一个承载名称的字段"来判, 而不是写死键名。
+        name_keys = ("title", "song_name", "name", "song", "text")
+        named = [r for r in rows if any(str(r.get(k) or "").strip() for k in name_keys)]
+        sample_names = [
+            next((r.get(k) for k in name_keys if str(r.get(k) or "").strip()), "")
+            for r in named[:3]
+        ]
 
         check(result.item_count > 0, "**提取到记录**", f"{result.item_count} 条")
         check(len(songs) > 0, "记录里含歌曲链接(/song)", f"{len(songs)} 条")
-        check(len(titles) > 0, "记录里含歌曲名称", f"{len(titles)} 条, 例: {titles[:2]}")
+        check(len(named) > 0, "记录里含歌曲名称字段",
+              f"{len(named)} 条; 字段={sorted({k for r in named for k in name_keys if r.get(k)})}; "
+              f"例: {sample_names}")
     finally:
         await crawler.close()
 

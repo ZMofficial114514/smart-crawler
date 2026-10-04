@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "smartcrawler"
 # 与 smartcrawler/__init__.py 的 __version__ 保持一致(那边是唯一来源)。改版本时两处都改, 并更新 CHANGELOG.md。
-version = "1.0.3"
+version = "1.1.0"
 description = "Playwright + AI 的智能爬虫框架, 自带毛玻璃风格图形化控制台"
 readme = "README.md"
 requires-python = ">=3.10"
