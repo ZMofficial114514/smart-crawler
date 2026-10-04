@@ -124,7 +124,11 @@ class Extractor:
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"DOM 提取失败: {type(exc).__name__}: {exc}")
                 return []
-            base_url = page.url
+            # 相对地址要以**内容所在 frame 的 URL** 为基准, 不是主文档的。
+            # 外壳 + 内嵌 iframe 的站点里两者不同(网易云: 主文档
+            # `music.163.com/#/search/m/?s=...` vs 内容 frame `music.163.com/search/...`),
+            # 用主文档当基准会把 `/song?id=1` 拼成带搜索参数的错地址。
+            base_url = str(getattr(target, "url", "") or "") or page.url
             return [self.post_process_row(row, rule, base_url) for row in items or []]
         return []
 
@@ -168,6 +172,14 @@ class Extractor:
         for f in rule.list_rule.fields:
             value = row.get(f.name)
             value = self.apply_transforms(value, f.transform, base_url=base_url)
+            # 相对地址自动补成绝对地址。
+            #
+            # 规则里本来可以带 ``url`` 变换, 但 AI 生成的规则经常漏掉它 —— 实测网易云的
+            # `link` 字段就原样输出 ``/song?id=2011072415``。这种值对用户没有意义(点不开),
+            # 下游的图片/音频下载插件也拿它没办法, 所以这里按**字段语义**兜底:
+            # 字段名像链接(href/url/link/src/...), 且值是站点内的相对路径时, 补成绝对地址。
+            # 只在"明显是链接字段"时动手, 避免把正文里恰好以 / 开头的普通文本改坏。
+            value = _absolutize(value, f, base_url)
             if f.required and (value is None or value == ""):
                 return {}
             out[f.name] = value
@@ -259,6 +271,38 @@ class Extractor:
             except ValidationError as exc:
                 errors.append(f"第 {i} 条记录校验失败: {exc.errors()[:2]}")
         return valid, errors
+
+
+#: 字段名里出现这些词, 且值是站点内相对路径时, 补成绝对地址。
+_URLISH_FIELD_RE = re.compile(
+    r"(?:^|_)(?:href|url|uri|link|src|source|image|img|thumb|thumbnail|photo|audio|video|"
+    r"avatar|cover|download)(?:$|_)",
+    re.IGNORECASE,
+)
+
+
+def _absolutize(value: Any, field: Any, base_url: str) -> Any:
+    """把"链接字段"里的相对地址补成绝对地址。
+
+    判据(三条同时满足): 字段名像链接 + base_url 可用 + 值是站点内相对路径。
+    ``//host/path``(协议相对)、``data:``、``javascript:``、``#`` 开头的一律不动。
+    """
+    if not isinstance(value, str) or not value or not base_url:
+        return value
+    name = str(getattr(field, "name", "") or "")
+    if not _URLISH_FIELD_RE.search(name):
+        return value
+    v = value.strip()
+    if v.startswith(("http://", "https://", "//", "data:", "javascript:", "mailto:", "#")):
+        return value
+    if not v.startswith("/"):
+        return value
+    try:
+        from urllib.parse import urljoin
+
+        return urljoin(base_url, v)
+    except Exception:  # noqa: BLE001
+        return value
 
 
 def _to_url(text: str, base_url: str) -> str:
