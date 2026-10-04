@@ -851,37 +851,105 @@ class StructureAnalyzer:
         return any(isinstance(c, int) and 0 <= c < 50 for c in (counts or []))
 
     @staticmethod
-    def _frame_looks_incomplete(
-        page: Page, raw: Any, frame_name: str, main_raw: Any, empty_iframe: bool = False
-    ) -> bool:
-        """内容是否明显"没到位", 值得重载重试一次。
+    async def _incomplete_reason(
+        page: Page, raw: Any, frame_name: str, main_raw: Any, settle_ok: bool = True
+    ) -> str:
+        """内容"没到位"的原因; 为空串表示看起来正常。
 
-        两个独立场景, 都实测出现过:
+        两种判据:
 
-        **A. 选中的是内层 frame, 但它只加载了一半**
-          实测网易云音乐内容 frame 正常 949~951 个元素、有 5 个候选; 半加载时停在 287 个、
-          连候选都没有, 比外壳(336)还小。
-          判据: 内层元素数 <= 外壳 × 1.2 且无候选。
+        **A. 选中的内层 frame 明显偏小**
+          实测网易云内容 frame 正常 949~951 个元素 / 5 个候选, 半加载时停在 287 个、
+          一个候选都没有, 反而比外壳(336)还小。判据: 内层元素数 <= 外壳 × 1.2。
 
-        **B. iframe 压根没加载, 于是只看到外壳**
-          这种情况"选中的"就是主文档, 只看选中的 frame 发现不了 —— 必须回头检查页面上
-          **有没有同源 iframe 却始终是空的**。实测网易云音乐偶发如此: 页面元素 288、
-          候选 3 个(全是导航), 而内容 frame 从未建立。
+        **B. 有同源 iframe 却几乎是空的**
+          实测 iframe 有时压根没加载(仍是 `about:blank`), 会被 `_accessible_frames`
+          过滤掉 —— 此时"选中的"就是主文档, **只看选中的 frame 是发现不了的**,
+          必须回头检查页面上有没有"同源却始终是空"的 iframe。
 
-        两个判据都只在"有 iframe"的页面上生效, 单文档站点不受影响。
+        两种都只与"有 iframe"的页面有关, 单文档站点不受影响。
         """
         if raw is None:
-            return False
+            return ""
 
-        # --- A: 选中的内层 frame 偏小且无候选 ---
+        # --- A: 选中的内层 frame 偏小 ---
         if frame_name:
             stats = raw.get("dom_stats") or {}
             inner = int(stats.get("total_elements") or 0)
             outer = int(((main_raw or {}).get("dom_stats") or {}).get("total_elements") or 0)
-            return not raw.get("candidates") and inner <= outer * 1.2
+            if outer and inner <= outer * 1.2:
+                return (f"内层 frame {frame_name!r} 只有 {inner} 个元素, "
+                        f"外壳有 {outer} 个(内容疑似未渲染)")
+            return ""
 
-        # --- B: 有 iframe 却始终是空的 ---
-        return empty_iframe
+        # --- B: 有 iframe 却几乎是空的 ---
+        probe = """() => [...document.querySelectorAll('iframe')].map(f => {
+            try {
+                const d = f.contentDocument;
+                return d ? d.querySelectorAll('*').length : -1;
+            } catch (e) { return -2; }   // 跨域: 忽略
+        })"""
+        try:
+            counts = await page.evaluate(probe)
+        except Exception:  # noqa: BLE001
+            return ""
+        empties = [c for c in (counts or []) if isinstance(c, int) and 0 <= c < 50]
+        if empties:
+            return f"页面上有 {len(empties)} 个同源 iframe 几乎是空的(元素数 {empties})"
+        return ""
+
+    @staticmethod
+    def _frame_looks_incomplete(
+        page: Page, raw: Any, frame_name: str, main_raw: Any, empty_iframe: bool = False
+    ) -> bool:
+        """``_incomplete_reason`` 的同步布尔版本(供测试与外部调用)。
+
+        只覆盖判据 A(内层 frame 偏小); 判据 B 需要查 DOM, 只能异步完成。
+        """
+        if not frame_name:
+            return bool(empty_iframe)
+        inner = int(((raw or {}).get("dom_stats") or {}).get("total_elements") or 0)
+        outer = int(((main_raw or {}).get("dom_stats") or {}).get("total_elements") or 0)
+        return bool(outer) and inner <= outer * 1.2
+
+    @staticmethod
+    async def _wait_for_playwright_frames(page: Page, *, timeout: float = 6.0,
+                                          interval: float = 0.4) -> None:
+        """等 DOM 里的同源 iframe 出现在 ``page.frames`` 中。
+
+        **为什么需要**: DOM 里已有 ``<iframe>`` 且其 ``contentDocument`` 可读, 并不代表
+        Playwright 已经把它注册成一个 Frame 对象 —— 重载之后尤其明显: 脚本能读到 iframe
+        文档, 但 `page.frames` 里还只有主文档, 于是 `_accessible_frames` 看不到内容 frame,
+        分析只能选中外壳。
+
+        判据: DOM 中**同源可读**的 iframe 数量(排除 about:blank 这类空壳) 与
+        ``page.frames`` 中除主文档外的数量是否一致; 不一致就等一会儿。
+        """
+        import asyncio as _asyncio
+
+        probe = """() => {
+            let readable = 0;
+            for (const f of document.querySelectorAll('iframe')) {
+                try {
+                    const d = f.contentDocument;
+                    // about:blank 说明这次导航还没提交, 不算"已就绪"
+                    if (d && d.location.href && d.location.href !== 'about:blank') readable++;
+                } catch (e) { /* 跨域 */ }
+            }
+            return readable;
+        }"""
+        loop = _asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while loop.time() < deadline:
+            try:
+                want = int(await page.evaluate(probe))
+            except Exception:  # noqa: BLE001
+                return
+            have = max(0, len(page.frames) - 1)
+            if want == 0 or have >= want:
+                return
+            logger.debug(f"等待 Playwright 注册 iframe: DOM {want} 个 / page.frames {have} 个")
+            await _asyncio.sleep(interval)
 
     async def _reload_and_settle(self, page: Page) -> bool:
         """重新加载当前页并等 frame 稳定; 成功返回 True。"""
@@ -891,73 +959,82 @@ class StructureAnalyzer:
             logger.warning(f"重新加载页面失败({type(exc).__name__}): {exc}")
             return False
         await self._wait_for_frames_to_settle(page)
+        await self._wait_for_playwright_frames(page)
         return True
 
     @staticmethod
     async def _wait_for_frames_to_settle(
         page: Page, *, timeout: float = 8.0, interval: float = 0.5,
-        stable_rounds: int = 2, growth_floor: int = 400,
-    ) -> None:
-        """等内层 frame 把内容渲染出来, 供"外壳 + 内嵌 iframe"的站点使用。
+        stable_rounds: int = 3, growth_floor: int = 400,
+    ) -> bool:
+        """等内容真正到位。返回是否"看起来已经稳定"。
 
-        **为什么不能只看主文档**: 外壳页在 ``domcontentloaded`` 时就已 complete, 而内层
-        iframe 的内容是之后异步注入的。实测网易云音乐: 外壳 284~336 个元素(只有导航与
-        播放条), 内容 frame 最终 949~955 个元素(30 条歌曲)。分析早于内容注入时, 内层 frame
-        只有 3~257 个元素, 会被判为"没什么内容", 于是选中外壳 —— 用户看到的就是
-        "有时候能抓到、有时候一条都没有"。
+        只在页面**有同源 iframe** 时才等 —— 单文档站点立刻返回, 不受影响。
 
-        **为什么"稳定"还不够**: 一个始终没填充的内层 frame 同样"稳定"。所以只有当元素数
-        **曾经超过** ``growth_floor`` 时才允许提前返回(说明页面确实长起来过、现在长完了);
-        否则"稳定"只当作"还没开始长", 继续等。
-
-        **为什么不能无条件等到超时**: 普通静态页(如 pixiv 搜索页, 约 100~200 个元素)永远
-        到不了 ``growth_floor``。若因此死等满 ``timeout``, 每个静态站都会白等 8 秒 ——
-        这是实测中真实发生过的回归。所以判据是"**明显在增长**就继续等": 采样值持续变大说明
-        内容还在注入, 值得等; 一直不动就尽早返回, 把时间交回给后续的提取等待。
+        判据(按优先级):
+          1. iframe 文档还在 ``readyState === 'loading'`` -> 必须继续等;
+          2. 最丰富的那个 frame 元素数曾经超过 ``growth_floor``(实测网易云内容 frame 约
+             950) -> 说明这页确实会长起来, 之后连续 ``stable_rounds`` 次不变即可开始分析;
+          3. 元素数一直低于 ``growth_floor`` -> 这是最难的一种, **无法用绝对大小区分
+             "页面本来就小"与"还没加载完"**(实测网易云外壳 336 个元素, 本地小靶站整页
+             只有 126 个, 任何固定阈值都会误判一边)。折中办法是给一个**较短的观察窗口**:
+             先看 ``observe`` 秒内有没有增长 —— 有增长就说明还会长, 继续等到超时;
+             完全没动过就认为"本来就小", 提前返回, 不让小页面白等满 8 秒。
         """
         import asyncio as _asyncio
 
         probe = """() => {
             const out = [document.querySelectorAll('*').length];
+            let loading = 0;
             for (const f of document.querySelectorAll('iframe')) {
                 try {
                     const d = f.contentDocument;
-                    if (d) out.push(d.querySelectorAll('*').length);
+                    if (d) {
+                        out.push(d.querySelectorAll('*').length);
+                        if (d.readyState === 'loading') loading++;
+                    }
                 } catch (e) { /* 跨域 iframe 读不到, 忽略 */ }
             }
-            return out;
+            return { counts: out, loading: loading };
         }"""
         try:
+            probe0 = await page.evaluate(probe)
+            if len(probe0.get("counts") or []) < 2:
+                return True  # 没有同源 iframe: 无需等待
+        except Exception:  # noqa: BLE001
+            return True
+
+        observe = 2.0  # 小页面的观察窗口
+        try:
+            t0 = _asyncio.get_event_loop().time()
+            deadline = t0 + max(0.0, timeout)
             last_max = -1
             peak = -1
-            saw_growth = False
             stable = 0
-            loop = _asyncio.get_event_loop()
-            deadline = loop.time() + max(0.0, timeout)
-            while loop.time() < deadline:
+            while True:
+                now = _asyncio.get_event_loop().time()
+                if now >= deadline:
+                    return False
                 try:
-                    counts = await page.evaluate(probe)
+                    pr = await page.evaluate(probe)
+                    counts = pr.get("counts") or []
+                    loading = int(pr.get("loading") or 0)
                     richest = max(counts) if counts else -1
                 except Exception:  # noqa: BLE001
-                    richest = -1
-                if richest > peak:
-                    # 曾经超过 growth_floor 就说明这页是"会长起来"的, 之后允许按稳定返回
-                    if richest >= growth_floor:
-                        saw_growth = True
-                    if last_max >= 0 and richest > last_max + 20:
-                        pass  # 明显增长, 继续等
-                    peak = richest
-                if richest == last_max:
-                    stable += 1
-                else:
-                    stable = 0
-                if stable >= stable_rounds and (saw_growth or peak < 0):
-                    # 长起来过且已经停了, 或者页面根本读不到元素 -> 可以开始分析
-                    return
+                    richest, loading = -1, 0
+                peak = max(peak, richest)
+                stable = stable + 1 if richest == last_max else 0
                 last_max = richest
+                big = peak >= growth_floor
+                # iframe 还在加载 -> 一律继续等
+                if loading:
+                    stable = 0
+                elif stable >= stable_rounds and (big or now - t0 >= observe):
+                    return True
                 await _asyncio.sleep(interval)
         except Exception as exc:  # noqa: BLE001 - 等待失败不该影响分析
             logger.debug(f"等待 frame 稳定时出错(忽略): {exc}")
+            return False
 
     @staticmethod
     def _accessible_frames(page: Page) -> list[Any]:
@@ -992,31 +1069,27 @@ class StructureAnalyzer:
         # 时内层 frame 还在导航, 元素数只有几十; 搜索结果是随后异步填进去的)。
         # 若不等待就打分, 会选中"当时较大"的主文档, 于是又回到只看到外壳的老问题。
         await self._wait_for_frames_to_settle(page)
+        await self._wait_for_playwright_frames(page)
 
         raw, frame_name, main_raw = await self._pick_richest_frame(page)
         if raw is None:
             logger.error(f"页面结构分析失败 {url}: 所有 frame 都不可读")
             return PageStructureReport(url=url, title="")
 
-        # 内层 frame "半加载"时重载页面重试一次。
+        # 内容"没到位"时重载页面重试一次。
         #
-        # 实测网易云音乐: 内容 frame 正常是 949~951 个元素, 但偶发停在 287 个(外壳 336) ——
-        # 此时它比外壳还小、也没有分页, 分析会选中它, 于是候选列表为空、抓取 0 条。
-        # 这种半加载态**同样满足"稳定"**, 等待没用, 只有重新导航才能恢复。
-        if self._frame_looks_incomplete(
-            page, raw, frame_name, main_raw,
-            empty_iframe=await self._empty_iframe_exists(page),
-        ):
-            logger.warning(
-                f"内容疑似未加载(frame={frame_name or '(主文档)'!r}, "
-                f"元素={(raw.get('dom_stats') or {}).get('total_elements')}, "
-                f"候选={len(raw.get('candidates') or [])}) —— 重新加载页面后再分析一次"
-            )
+        # 实测两种失败态(都真实出现过, 且都**满足"元素数稳定"**, 所以等待救不了):
+        #   A. 内层 frame 只加载了一半: 正常 949~951 个元素 / 5 个候选, 半加载时停在 287 个;
+        #   B. iframe 压根没加载: 仍是 about:blank, 被 _accessible_frames 过滤掉,
+        #      于是只看到外壳(288 个元素 / 3 个候选, 全是导航)。
+        # 只有重新导航才能恢复, 所以这里重载一次再分析。
+        reason = await self._incomplete_reason(page, raw, frame_name, main_raw)
+        if reason:
+            logger.warning(f"内容疑似未到位({reason}) —— 重新加载页面后再分析一次")
             if await self._reload_and_settle(page):
                 raw2, frame_name2, main_raw2 = await self._pick_richest_frame(page)
-                if raw2 is not None and not self._frame_looks_incomplete(
-                    page, raw2, frame_name2, main_raw2,
-                    empty_iframe=await self._empty_iframe_exists(page),
+                if raw2 is not None and not await self._incomplete_reason(
+                    page, raw2, frame_name2, main_raw2
                 ):
                     raw, frame_name, main_raw = raw2, frame_name2, main_raw2
                     logger.info("重载后内容已到位")
