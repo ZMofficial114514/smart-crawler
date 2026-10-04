@@ -182,6 +182,78 @@ _ANALYZE_JS = r"""
         return tagClass(el);
     };
 
+    // ---- 给字段取一个"能看懂"的名字 ----
+    //
+    // 默认命名用的是元素的稳定 class(第一个), 但很多站点的 class 是构建工具生成的短哈希,
+    // 对用户毫无意义。实测网易云音乐: 歌手名那一列的 class 是 `s-fc7`, 于是规则里出现
+    // `s-fc7` 这种键, 用户根本分不清哪个是歌手、哪个是专辑、哪个是时长。
+    //
+    // 这里用**语义信号**取代它: URL 路径与文案里往往已经写明了这一列是什么
+    // (/artist?id= -> 歌手, /album?id= -> 专辑, 03:45 -> 时长)。
+    // 只在能明确判断时才改名, 判断不出就保留原 class, 避免瞎猜。
+    const semanticName = (el, text, fallback) => {
+        const a = el.closest ? el.closest('a[href]') : null;
+        const href = a ? (a.getAttribute('href') || '') : '';
+        const t = (text || '').trim();
+        // 组合信号: URL 路径 + 文案关键词(中英日)
+        const probe = (href + ' ' + t).toLowerCase();
+        const rules = [
+            // 作者/用户类
+            [/\/artist|\/musician|\/singer|歌手|艺术家|艺人|演唱|artist/i, 'artist'],
+            [/\/album|\/disc|专辑|唱片|album/i, 'album'],
+            [/\/user|\/uid|\/member|\/profile|\/author|用户|作者|博主|up主|uploader|\buser\b|\bauthor\b/i, 'user'],
+            // 时长/日期/计数类
+            [/^\d{1,2}:\d{2}(:\d{2})?$|时长|duration|length/i, 'duration'],
+            [/\d{4}-\d{1,2}-\d{1,2}|\d{1,2}\/\d{1,2}\/\d{4}|日期|发布时间|发布于|date|time/i, 'date'],
+            [/播放|收听|播放量|play\s*count|views?|播放次数/i, 'play_count'],
+            [/评论|回复|comment|repl/i, 'comment_count'],
+            [/专辑|所属专辑/i, 'album'],
+            [/类型|分类|标签|category|genre|tag/i, 'category'],
+        ];
+        for (const [re, name] of rules) {
+            if (re.test(probe)) return name;
+        }
+        return fallback;
+    };
+
+    // ---- 丢弃"指向同一元素、名字却是构建产物"的冗余字段 ----
+    //
+    // 实测网易云音乐: 专辑那一格同时产出两个字段 ——
+    //     album     选择器 div.td.w2 a.s-fc3 span.s-fc7   (认出 /album 路径, 名字可读)
+    //     s-fc7     选择器 div.td.w2 a.s-fc3 span.s-fc7   (同名元素, 名字不可读)
+    // 二者选择器完全相同, 结果表格里就会出现两列一模一样的数据, 用户还得猜哪列是什么。
+    //
+    // 判据: 选择器(含属性)完全相同 + 该名字是构建产物类名 -> 丢掉。只在**有另一个**
+    // 更可读的字段指着同一元素时才丢, 避免把唯一的字段也删掉。
+    const SELF_NAMES = new Set(['title', 'link', 'image', 'audio', 'video', 'price',
+                                'thumb', 'image_srcset', 'text']);
+    const looksGenerated = (name) => {
+        if (!name || SELF_NAMES.has(name)) return false;
+        // s-fc7 / u-icn2 / f-fs1 这类"字母+数字"的样式钩子
+        if (/^[a-z]{1,3}-?[a-z]{0,4}\d{1,3}$/i.test(name)) return true;
+        // css-1x2y3z / sc-bdVaJa 这类 CSS-in-JS 生成名
+        if (/^(css|sc|jsx|emotion|styled)-/i.test(name)) return true;
+        // 纯哈希(6 位以上大小写混合)
+        if (name.length >= 6 && /^[a-z]+[A-Z]/.test(name)) return true;
+        return false;
+    };
+    const dropRedundantFields = (sample, fields) => {
+        if (fields.length < 2) return fields;
+        const keep = [];
+        for (let i = 0; i < fields.length; i++) {
+            const f = fields[i];
+            if (!looksGenerated(f.name)) { keep.push(f); continue; }
+            // 有别的字段用同一个选择器 + 同一个属性, 且那个名字可读 -> 本字段冗余
+            const dup = fields.some((g, j) =>
+                j !== i && g.selector === f.selector &&
+                (g.attribute || '') === (f.attribute || '') && !looksGenerated(g.name));
+            if (!dup) keep.push(f);
+        }
+        // 语义字段可能确实抓不到内容(站点把该列留空), 那也不该因此让用户失去这一列 ——
+        // 这里只在"冗余"时丢弃, 不做"空值"判断(空值判断在提取阶段才有意义)。
+        return keep;
+    };
+
     // ---- 从样本列表项推断字段 ----
     const sampleFields = (sample) => {
         const fields = [];
@@ -260,8 +332,19 @@ _ANALYZE_JS = r"""
         if (link) {
             const sel = relSelector(sample, link);
             const text = ((link.innerText || '')).trim();
-            if (sel && text) { push('title', sel, null); push('link', sel, 'href'); }
-            else if (sel) { push('link', sel, 'href'); }
+            if (sel && text) {
+                // 首个链接不一定是标题 —— 网易云音乐的作品卡里第一个 <a> 是歌手链接。
+                // 交给 semanticName 判定: 它认出 /artist 就会命名成 artist 而不是 title。
+                const nm = semanticName(link, text, 'title');
+                if (nm === 'title') {
+                    push('title', sel, null);
+                } else {
+                    push(nm, sel, null);
+                }
+                push('link', sel, 'href');
+            } else if (sel) {
+                push('link', sel, 'href');
+            }
         }
         // 价格类叶子文本
         sample.querySelectorAll('*').forEach(el => {
@@ -280,10 +363,10 @@ _ANALYZE_JS = r"""
             const cls = stableClasses(el);
             const tag = el.tagName.toLowerCase();
             // 无 class 的裸标签给中性名(后续归一化: text -> title)
-            const name = cls.length ? cls[0] : (tag === 'a' ? 'text' : tag);
-            push(name, relSelector(sample, el), null);
+            const base = cls.length ? cls[0] : (tag === 'a' ? 'text' : tag);
+            push(semanticName(el, t, base), relSelector(sample, el), null);
         });
-        return fields;
+        return dropRedundantFields(sample, fields);
     };
 
     // ---- 重复结构识别 ----
@@ -717,48 +800,53 @@ class StructureAnalyzer:
 
     @staticmethod
     async def _wait_for_frames_to_settle(
-        page: Page, *, timeout: float = 6.0, interval: float = 0.5, stable_rounds: int = 2
+        page: Page, *, timeout: float = 15.0, interval: float = 0.5,
+        stable_rounds: int = 2, min_elements: int = 400,
     ) -> None:
-        """等各 frame 的元素总数稳定下来, 供 iframe 站点使用。
+        """等内层 frame 把内容渲染出来, 供"外壳 + 内嵌 iframe"的站点使用。
 
-        判据是"连续 ``stable_rounds`` 次采样总数不变"。只要有 frame 还在长(说明内容
-        仍在异步渲染), 就继续等, 最多 ``timeout`` 秒。
+        **为什么不能只看主文档**: 外壳页在 ``domcontentloaded`` 时就已 complete, 而内层
+        iframe 的内容是之后异步注入的。此前实测网易云音乐: 外壳 284~336 个元素(只有导航和
+        播放条), 内容 frame 最终 949~955 个元素(30 条歌曲)。分析早于内容注入时, 内层 frame
+        只有 3~257 个元素, 会被判为"没什么内容", 于是选中外壳 —— 用户看到的就是
+        "有时候能抓到、有时候一条都没有"。
 
-        为什么不能只等主文档: 外壳页在 ``domcontentloaded`` 时就已 complete, 但内层
-        iframe 的内容是之后注入的。此时若立刻打分, 内层 frame 元素数很少, 会被判为
-        "没有内容", 于是选中外壳 —— 用户看到的正是"登录前后抓到的都是这个外壳页"。
+        **为什么"稳定"还不够**: 一个始终没填充的内层 frame 同样"稳定"。所以还要求
+        **最丰富的那个 frame** 元素数达到 ``min_elements``; 达不到就继续等, 直到超时。
+
+        **为什么要按 frame 分别看**: 只看"主文档 + 所有 iframe 的元素总数"会把外壳自己的
+        300 多个元素也算进去, 于是"总数已经够了"而内层其实还是空的。
         """
         import asyncio as _asyncio
 
         probe = """() => {
-            const skip = (u) => !u || u.startsWith('about:') || u.startsWith('data:')
-                              || u.startsWith('blob:');
-            let total = 0;
+            const out = [document.querySelectorAll('*').length];
             for (const f of document.querySelectorAll('iframe')) {
-                // 同源可读的 iframe 才算(跨域读 contentDocument 会抛)
                 try {
                     const d = f.contentDocument;
-                    if (d) total += d.querySelectorAll('*').length;
-                } catch (e) { /* 跨域, 忽略 */ }
+                    if (d) out.push(d.querySelectorAll('*').length);
+                } catch (e) { /* 跨域 iframe 读不到, 忽略 */ }
             }
-            return document.querySelectorAll('*').length + total;
+            return out;
         }"""
         try:
-            last = -1
+            last_max = -1
             stable = 0
-            deadline = _asyncio.get_event_loop().time() + max(0.0, timeout)
-            while _asyncio.get_event_loop().time() < deadline:
+            loop = _asyncio.get_event_loop()
+            deadline = loop.time() + max(0.0, timeout)
+            while loop.time() < deadline:
                 try:
-                    total = int(await page.evaluate(probe))
+                    counts = await page.evaluate(probe)
+                    richest = max(counts) if counts else -1
                 except Exception:  # noqa: BLE001
-                    total = -1
-                if total == last and total > 0:
+                    richest = -1
+                if richest == last_max and richest >= min_elements:
                     stable += 1
                     if stable >= stable_rounds:
                         return
                 else:
                     stable = 0
-                last = total
+                last_max = richest
                 await _asyncio.sleep(interval)
         except Exception as exc:  # noqa: BLE001 - 等待失败不该影响分析
             logger.debug(f"等待 frame 稳定时出错(忽略): {exc}")

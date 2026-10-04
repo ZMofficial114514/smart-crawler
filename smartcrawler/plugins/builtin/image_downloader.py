@@ -128,7 +128,8 @@ class ImageDownloaderPlugin(BasePlugin):
         field = str(ctx.config.get("item_field") or "").strip()
         selector = str(ctx.config.get("dom_selector") or "").strip()
         # 任务参数优先于插件配置: 用户在抓取页填的数量/目标里的"前三张"是本次任务意图
-        limit = resolve_limit(ctx, 200)
+        # 专用键排在通用键之前, 避免用户填了专用项却被通用项顶掉
+        limit = resolve_limit(ctx, 200, dedicated_keys=("max_items", "max_images"))
         min_width = int(ctx.config.get("min_width") or 0)
 
         collected: list[tuple[str, Optional[int]]] = []

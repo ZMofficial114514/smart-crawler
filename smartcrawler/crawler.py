@@ -24,6 +24,7 @@ SmartCrawler.crawl() 的完整数据流:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from typing import Any, Callable, Optional, Type
@@ -37,7 +38,7 @@ from .anti_spider import RobotsChecker
 from .browser import BrowserManager
 from .challenge import detect_challenge
 from .config import Settings, get_settings
-from .extractor import Extractor
+from .extractor import _EXTRACT_DOM_JS, Extractor
 from .lazy_load import scroll_to_load
 from .login_state import detect_login_state
 from .overlay import dismiss_overlays
@@ -45,8 +46,10 @@ from .plugins.builtin._media_transform import MEDIA_LIMIT_KEY, parse_count_from_
 from .models import (
     ExtractionRule,
     ExtractedItem,
+    FieldSpec,
     NetworkRecord,
     PageStructureReport,
+    PaginationRule,
     TaskResult,
 )
 from .network import NetworkRecorder
@@ -156,6 +159,151 @@ COMPLIANCE_NOTICE = (
     "SmartCrawler 合规提示: 请确保目标网站允许采集(robots.txt / 服务条款), "
     "本工具仅用于合法授权的数据采集场景。"
 )
+
+
+#: 两列取值完全相同时, 优先保留这些"主字段"名。
+#: 例: song_name 与 title 取到同一串文本时保留 title(框架与分析器的通用主字段名)。
+_PRIMARY_FIELD_NAMES = frozenset({
+    "title", "name", "song_name", "image", "link", "url", "price", "artist", "user",
+})
+
+
+#: 无语义的"构建产物类名"模式(样式钩子, 不是数据语义)。
+#: 与 structure.py 里 JS 侧的判断保持一致: 那里管的是同一个元素被重复命名,
+#: 这里管的是"分析结果的字段名本身就不值得作为结果列"。
+#:
+#: **注意不能加 re.IGNORECASE**: 哈希分支要求"真有大写字母", 加了忽略大小写之后
+#: `artist` 会被 `[a-z]+[A-Z][A-Za-z]{2,}` 当成哈希(a-r-tist)匹配掉, 把有效字段误杀。
+_GENERATED_NAME_RE = re.compile(
+    r"^(?:[a-z]{1,3}-?[a-z]{0,4}\d{1,3}"          # s-fc7 / u-icn2 / f-fs1
+    r"|(?:css|sc|jsx|emotion|styled)-.*"           # CSS-in-JS(前缀之后任意内容)
+    r"|[a-z]{2,}[A-Z][a-zA-Z]{2,}"                 # bdVaJa 这类哈希(必须真有大写)
+    r"|td|th|tr|span|div|li|em|b|i|p)$",           # 纯标签名
+)
+
+
+def looks_generated_name(name: str) -> bool:
+    """字段名是否是"构建产物"—— 无语义, 不该出现在用户看到的结果里。"""
+    return bool(name) and bool(_GENERATED_NAME_RE.match(name.strip()))
+
+
+def _field_attr(field: Any, key: str, default: Any = "") -> Any:
+    """从"候选字段"里取属性, 兼容 dict 与对象两种形态。
+
+    **踩过的坑**: ``ListCandidate.sample_fields`` 在内存里是 ``list[dict]``
+    (形如 ``{"name": "artist", "selector": "...", "attribute": None}``), 不是 pydantic 模型。
+    我最初用 ``getattr(sf, "name", "")`` 取值, 对 dict 只会拿到默认值 —— 于是字段名全是空串,
+    补齐逻辑静默什么也没补, 表现成"歌手/专辑列时有时无"。
+    日志里那句 ``分析候选提供 ['', '', ...]`` 就是这条线索。
+    """
+    if isinstance(field, dict):
+        return field.get(key, default)
+    return getattr(field, key, default)
+
+
+def _analyzed_field_map(report: Any, item_selector: str) -> dict[str, tuple[str, Any]]:
+    """从结构报告里取"字段名 -> (选择器, 属性)"的映射, 供替换失效字段用。
+
+    优先取与 ``item_selector`` 完全相同的那份候选; 没有就取字段最多的候选。
+    """
+    candidates = getattr(report, "candidate_lists", None) or []
+    if not candidates:
+        return {}
+    match = None
+    for c in candidates:
+        if str(getattr(c, "item_selector", "") or "") == item_selector:
+            match = c
+            break
+    if match is None:
+        match = max(candidates, key=lambda c: len(getattr(c, "sample_fields", None) or []))
+    out: dict[str, tuple[str, Any]] = {}
+    for sf in getattr(match, "sample_fields", None) or []:
+        name = str(_field_attr(sf, "name") or "").strip()
+        selector = str(_field_attr(sf, "selector") or "").strip()
+        if name and selector and name not in out:
+            out[name] = (selector, _field_attr(sf, "attribute", None))
+    return out
+
+
+def _merge_analyzed_fields(rule: Any, report: Any) -> None:
+    """把结构分析已识别、但规则里缺失的字段补回去。
+
+    **为什么需要**: AI 选字段是不确定的。实测同一个网易云搜索页连跑三次, 规则字段分别是
+    ``[song_name, link, artist, album]``、``[song_name, link]``、``[song_name, song_url,
+    artist, album]`` —— 第二次把歌手与专辑整列丢了, 而分析阶段明明识别出来了。
+    用户看到的就是"同一个任务, 有时有歌手列, 有时没有"。
+
+    分页那边用「验证 AI 的选择器能否匹配到元素」兜底, 字段这边用「补齐分析结果」兜底 ——
+    两者都是同一个原则: **模型不确定的部分, 由已验证的分析结果来保证**。
+
+    只在 AI 生成的规则上补齐(``source`` 以 ``ai`` 开头), 且只补分析结果里确实有样本值的
+    字段; 若 AI 已经给了同名字段则保留 AI 的(它可能换了更准的选择器)。
+    """
+    list_rule = getattr(rule, "list_rule", None)
+    if list_rule is None or not str(getattr(rule, "source", "")).startswith("ai"):
+        return
+    candidates = getattr(report, "candidate_lists", None) or []
+    if not candidates:
+        return
+
+    # 用 item_selector 找出 AI 选的那个候选; 找不到就取字段最多的候选
+    ai_sel = str(getattr(list_rule, "item_selector", "") or "")
+    match = None
+    for c in candidates:
+        if str(getattr(c, "item_selector", "") or "") == ai_sel:
+            match = c
+            break
+    if match is None:
+        match = max(candidates, key=lambda c: len(getattr(c, "sample_fields", None) or []))
+
+    existing = {str(getattr(f, "name", "") or "") for f in (getattr(list_rule, "fields", None) or [])}
+    # 同时按**选择器+属性**判重, 而不是只看字段名。
+    #
+    # 这是关键: AI 常把标题字段命名为 `song_name`, 而分析结果叫 `title` —— 若只按名字判重,
+    # 后续字段不受影响, 但一旦 AI 与分析对同一列用了不同名字, 就会出现"同一列两遍"或
+    # "该补的没补"。实测网易云音乐 4 次抓取里只有 1 次带上了歌手与专辑列。
+    rule_fields = list(getattr(list_rule, "fields", None) or [])
+    existing_sel = {
+        (str(getattr(f, "selector", "") or ""), str(getattr(f, "attribute", "") or ""))
+        for f in rule_fields
+    }
+    added: list[str] = []
+    for sf in getattr(match, "sample_fields", None) or []:
+        name = str(_field_attr(sf, "name") or "").strip()
+        selector = str(_field_attr(sf, "selector") or "").strip()
+        attr = str(_field_attr(sf, "attribute") or "")
+        if not name or not selector:
+            continue
+        # 无语义的构建产物类名(s-fc7 / td / css-1x2y3z)不作为结果列 ——
+        # 补进来只会让用户多看到几个看不懂的列, 与"让用户分得清哪列是歌手"的目标相反。
+        if looks_generated_name(name):
+            continue
+        # 这一列已经有人管了(同一选择器+属性), 或同名字段已存在 -> 不重复添加
+        if (selector, attr) in existing_sel or name in existing:
+            continue
+        try:
+            list_rule.fields.append(
+                FieldSpec(
+                    name=name,
+                    selector=selector,
+                    attribute=_field_attr(sf, "attribute", None),
+                )
+            )
+        except Exception:  # noqa: BLE001 - 字段模型不匹配时跳过该字段
+            continue
+        existing.add(name)
+        existing_sel.add((selector, attr))
+        added.append(name)
+    if added:
+        logger.info(f"补齐分析阶段识别到、规则里缺失的字段: {added}")
+    else:
+        # 静默无操作是最难排查的状态 —— 记录"为什么没补", 否则只能看到结果里少列。
+        analyzed = [str(_field_attr(sf, "name") or "") for sf in
+                    (getattr(match, "sample_fields", None) or [])]
+        logger.info(
+            f"字段补齐无需改动: 规则已有 {len(rule_fields)} 个字段 {sorted(existing)}, "
+            f"分析候选提供 {analyzed}"
+        )
 
 
 class SmartCrawler:
@@ -427,6 +575,19 @@ class SmartCrawler:
                     result.errors.append("无法确定提取规则(无候选列表/AI不可用/未传规则)")
                     return self._finalize(result, started, page)
                 assert rule.list_rule is not None
+
+                # AI 写出的 next_selector 必须先验证再使用。
+                #
+                # 实测网易云音乐: AI 给出的分页选择器是 `a.zpgn`, 而页面上根本没有这个类名
+                # (真实是 `zbtn znxt`)。框架自己的 detectPagination 已经识别出正确的分页,
+                # 但 AI 的规则会把它覆盖掉 —— 结果点击永远失败, 页数停在 1。
+                # 模型看不到完整 DOM, 凭印象拼一个"看着像"的类名是常见失败方式,
+                # 所以这里以**能否在真实 DOM 上匹配到元素**为准, 匹配不到就回退到已验证的分页。
+                await self._validate_ai_pagination(page, rule, report, frame_name=report.content_frame or "")
+                # 把分析阶段已经识别出、但 AI 漏掉的字段补回规则里。
+                _merge_analyzed_fields(rule, report)
+                # 再验证每个字段是否真能取到值 —— 取不到的字段用分析结果里的选择器替换。
+                await self._validate_rule_fields(page, rule, report, frame_name=report.content_frame or "")
 
                 # ---------- 7. 首页提取 ----------
                 await self.plugins.run_async("before_extract", ctx, only=plugin_ids)
@@ -711,15 +872,11 @@ class SmartCrawler:
         deadline = time.monotonic() + max(0.0, timeout)
         first = True
         while True:
-            try:
-                n = await target.evaluate(
-                    "(sel) => { try { return document.querySelectorAll(sel).length } "
-                    "catch (e) { return -1 } }",
-                    selector,
-                )
-            except Exception:  # noqa: BLE001 - 页面正在导航时会短暂失败
-                n = -1
-            if isinstance(n, int) and n > 0:
+            # 用 _count_matches(locator) 而不是 querySelectorAll —— 规则里的选择器可能是
+            # XPath, querySelectorAll 对 XPath 一律抛异常, 会被误判成"列表还没出现",
+            # 于是白等到超时。
+            n = await self._count_matches(target, str(selector))
+            if n > 0:
                 if not first:
                     logger.info(f"等待生效: 第 {n} 个元素出现(选择器 {truncate(selector, 60)})")
                 return True
@@ -727,6 +884,162 @@ class SmartCrawler:
                 return False
             first = False
             await asyncio.sleep(interval)
+
+    @staticmethod
+    async def _count_matches(scope, selector: str) -> int:
+        """数选择器在 scope(Page 或 Frame)上匹配到几个元素, 数不出来返回 -1。
+
+        **用 Playwright 的 locator 而不是 page.evaluate + querySelectorAll。**
+        `querySelectorAll` 只认 CSS, 而框架允许的选择器语法包含 XPath
+        (以 `//`、`(//`、`./`、`xpath=` 开头, 见 models.py 的说明)。实测 AI 给出的分页
+        选择器正是 XPath(`//a[contains(normalize-space(text()),'下一页')]`)——
+        用 querySelectorAll 会一律报"匹配 0 个", 把一个**有效**选择器误判为无效。
+        locator() 同时支持 CSS / XPath / 文本引擎, 与真实使用路径一致。
+        """
+        try:
+            return await scope.locator(selector).count()
+        except Exception as exc:  # noqa: BLE001 - 非法语法或页面正在导航
+            logger.debug(f"选择器匹配数计算失败({truncate(selector, 50)}): {exc}")
+            return -1
+
+    async def _validate_rule_fields(
+        self, page, rule: ExtractionRule, report, *, frame_name: str = ""
+    ) -> None:
+        """检查每个字段能否真的取到值, 取不到就用分析结果里的选择器替换。
+
+        **为什么需要**: 规则里的每个字段都是一条"相对列表项"的选择器。它可能看起来合理、
+        在文档级也能命中, 但相对列表项却查不到 —— 实测网易云音乐就是这样: 规则给出
+        ``div.td.w1 div.text a`` 取歌手, 而提取结果里 artist 列整列为空, 同一份分析报告里
+        的候选字段用的却是 ``div.td.w1 div.text a`` 之外的写法。用户看到的是"有的列有值、
+        有的列全空", 而且每次跑还不一样。
+
+        判据是**取到值的行数**: 全部为空才认为该字段失效(部分为空是正常的, 页面本来就有
+        缺列)。这样不会因为个别行缺数据而误改规则。
+        """
+        list_rule = getattr(rule, "list_rule", None)
+        fields = list(getattr(list_rule, "fields", None) or []) if list_rule else []
+        if not fields or not getattr(list_rule, "item_selector", ""):
+            return
+        target = self.extractor.resolve_frame(page, frame_name)
+        try:
+            rows = await target.evaluate(_EXTRACT_DOM_JS, rule.model_dump(mode="json"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"字段有效性检查失败(忽略): {exc}")
+            return
+        if not rows:
+            return
+
+        # 分析结果里同名字段的选择器, 作为替换来源
+        alt = _analyzed_field_map(report, str(getattr(list_rule, "item_selector", "")))
+        replaced: list[str] = []
+        for f in fields:
+            name = str(getattr(f, "name", "") or "")
+            got = sum(1 for r in rows if str(r.get(name) or "").strip())
+            if got:
+                continue
+            cand = alt.get(name)
+            if not cand or cand[0] == str(getattr(f, "selector", "") or ""):
+                logger.warning(f"字段 {name!r} 在 {len(rows)} 行里全部为空, 且没有可替换的选择器")
+                continue
+            old = str(getattr(f, "selector", "") or "")
+            f.selector = cand[0]
+            if cand[1] is not None:
+                f.attribute = cand[1]
+            replaced.append(f"{name}: {truncate(old, 34)} -> {truncate(cand[0], 34)}")
+
+        if replaced:
+            logger.warning("字段选择器取不到值, 已用分析结果替换: " + "; ".join(replaced))
+            # 替换后再看一次, 只记录结论(不改动规则)
+            try:
+                rows2 = await target.evaluate(_EXTRACT_DOM_JS, rule.model_dump(mode="json"))
+                fixed = [str(getattr(f, "name", "")) for f in fields
+                         if any(str(r.get(str(getattr(f, "name", ""))) or "").strip() for r in rows2)]
+                logger.info(f"替换后能取到值的字段: {fixed}")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 去掉"取到的值完全一样"的重复列。
+        #
+        # 成因: AI 与分析器可能对同一列给出**略微不同**的选择器 —— AI 用
+        # `div.td.w0 div.text a`(整个链接), 分析器用 `div.td.w0 div.sn span.s-fc7`
+        # (链接内的标题 span)。两者取到的文本一模一样, 选择器却不相等, 于是上面按
+        # 选择器判重的逻辑拦不住, 结果里就出现 song_name 与 title 两列相同的值。
+        # 判据用"所有行取值都相同", 比按选择器比对更贴近用户实际看到的东西。
+        try:
+            rows3 = await target.evaluate(_EXTRACT_DOM_JS, rule.model_dump(mode="json"))
+        except Exception:  # noqa: BLE001
+            return
+        if not rows3 or len(fields) < 2:
+            return
+        fingerprints: list[tuple[str, tuple[str, ...]]] = []
+        for f in fields:
+            fname = str(getattr(f, "name", "") or "")
+            vals = tuple(str(r.get(fname) or "") for r in rows3)
+            fingerprints.append((fname, vals))
+        drop: set[str] = set()
+        for i in range(len(fingerprints)):
+            ni, vi = fingerprints[i]
+            if ni in drop or not any(vi):
+                continue
+            for j in range(i + 1, len(fingerprints)):
+                nj, vj = fingerprints[j]
+                if nj in drop or vi != vj:
+                    continue
+                # 值完全相同: 保留名字更像"主字段"的那个, 去掉另一个
+                # (长度更短、或命中常见主字段名者优先; 都不满足则保留先出现的)
+                prefer_first = ni.lower() in _PRIMARY_FIELD_NAMES
+                dropped = nj if prefer_first else ni
+                drop.add(dropped)
+                logger.info(f"字段 {dropped!r} 与 {ni if prefer_first else nj!r} 取值完全相同, 已去重")
+                if not prefer_first:
+                    break
+        if drop:
+            list_rule.fields = [f for f in list_rule.fields
+                                if str(getattr(f, "name", "") or "") not in drop]
+
+    async def _validate_ai_pagination(
+        self, page, rule: ExtractionRule, report, *, frame_name: str = ""
+    ) -> None:
+        """校验规则里的 next_selector 是否真的能匹配到元素, 不能则回退。
+
+        **为什么需要**: AI 看不到完整 DOM, 可能凭印象拼出一个"看着像"的类名。
+        实测网易云音乐: AI 给出 `a.zpgn`, 而页面真实类名是 `zbtn znxt` ——
+        `a.zpgn` 匹配 0 个元素。框架自己的 detectPagination 已识别出正确分页, 但被 AI 的
+        规则覆盖, 于是点击永远失败、页数停在 1。分析与提取都会重新取分页, 所以这里把
+        rule 里那个无效选择器换成已验证的那个即可。
+
+        只做"能不能匹配到"的检查, 不点击 —— 点击会消耗一页, 验证成本过高。
+        """
+        pag = getattr(rule, "pagination", None)
+        selector = getattr(pag, "next_selector", None) if pag else None
+        if not selector:
+            return
+        target = self.extractor.resolve_frame(page, frame_name)
+        n = await self._count_matches(target, str(selector))
+        if n > 0:
+            logger.info(f"分页选择器已验证: {truncate(str(selector), 60)} 匹配 {n} 个元素")
+            return
+
+        fallback = getattr(report, "pagination", None)
+        fallback_sel = getattr(fallback, "next_selector", None) if fallback else None
+        if fallback_sel and fallback_sel != selector:
+            logger.warning(
+                f"分页选择器 {truncate(str(selector), 50)} 匹配不到元素"
+                f"({n} 个) —— 回退到框架识别出的 {truncate(str(fallback_sel), 50)}"
+            )
+            if getattr(rule, "source", "") == "ai":
+                rule.source = "ai+分页回退"
+            rule.pagination = PaginationRule(
+                next_selector=str(fallback_sel),
+                max_pages=getattr(pag, "max_pages", None) or 1,
+                next_text=getattr(fallback, "next_text", None),
+            )
+        else:
+            logger.warning(
+                f"分页选择器 {truncate(str(selector), 50)} 匹配不到元素({n} 个), "
+                "且没有可用的回退分页 —— 将只抓第 1 页"
+            )
+            rule.pagination = None
 
     async def _retry_json_with_ai(self, rule: ExtractionRule) -> list[dict[str, Any]]:
         """json 模式兜底: 把最大的 JSON 响应交给 AI 重新分析字段。"""

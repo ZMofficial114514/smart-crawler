@@ -211,14 +211,19 @@ MEDIA_LIMIT_KEY = "media_limit"
 PLUGIN_LIMIT_KEY = "max_items"
 
 
-def resolve_limit(ctx: Any, plugin_default: int) -> int:
+def resolve_limit(
+    ctx: Any, plugin_default: int, *, dedicated_keys: tuple[str, ...] = ()
+) -> int:
     """决定本次任务该类媒体的下载上限。
 
-    优先级: **任务参数 > 插件配置 > 内置默认**。
+    优先级: **任务参数 > 插件专用配置 > 通用配置 > 内置默认**。
 
     任务的优先级最高是有原因的: 用户在抓取页填的"下载数量"或直接写在抓取目标里的
     "爬取前三张", 都是**本次任务**的意图, 不该被插件的长期配置覆盖 —— 实测就是这么
     出现"说好前三张, 结果下了 24 张"的。
+
+    ``dedicated_keys``: 该插件自己的上限配置键(如音频用 ``max_audio``)。放在通用键之前,
+    以免用户填了专用项却被通用项顶掉。
     """
     data = getattr(ctx, "data", None) or {}
     task_limit = data.get(MEDIA_LIMIT_KEY)
@@ -231,7 +236,12 @@ def resolve_limit(ctx: Any, plugin_default: int) -> int:
             pass
 
     config = getattr(ctx, "config", None) or {}
-    for key in (PLUGIN_LIMIT_KEY, "max_images", "max_files", "max_songs"):
+    # 键的优先级: 插件自己的专用键在前, 通用键在后。
+    #
+    # `max_audio` / `max_images` / `max_songs` 是各自插件的**专用**上限, 必须先看 ——
+    # 否则用户把"最多下载 5 首"填在音频专用项里, 却因为通用键 `max_items` 也有值而被忽略。
+    # 实测中这两个插件共用同一套兜底键, 顺序错了就会互相顶掉。
+    for key in (*dedicated_keys, PLUGIN_LIMIT_KEY, "max_images", "max_files", "max_songs"):
         if key in config:
             try:
                 value = int(config[key])

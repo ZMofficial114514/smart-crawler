@@ -76,12 +76,16 @@ class MusicDownloaderPlugin(BasePlugin):
             "max": 2048,
         },
         {
-            "key": "max_files",
-            "label": "单次任务最多下载",
+            "key": "max_audio",
+            "label": "最多下载音频数",
             "type": "int",
             "default": 50,
             "min": 1,
             "max": 1000,
+            "description": (
+                "本次任务最多下载多少个音频文件。优先级: 抓取页的「下载数量」> 抓取目标里的"
+                "数量说法(如「前 3 首」)> 本项 > 通用上限。"
+            ),
         },
         {
             "key": "dedupe_by_stem",
@@ -95,8 +99,9 @@ class MusicDownloaderPlugin(BasePlugin):
     async def after_extract(self, ctx: PluginContext, items: list[dict[str, Any]]):
         configured = str(ctx.config.get("item_field") or "").strip()
         fields = [configured] if configured else list(_AUDIO_FIELD_CANDIDATES)
-        # 任务参数优先: 抓取页的"下载数量"或抓取目标里的"前三首"是本次任务的意图
-        limit = resolve_limit(ctx, 50)
+        # 任务参数优先: 抓取页的"下载数量"或抓取目标里的"前三首"是本次任务的意图。
+        # 专用键 max_audio 排在通用键之前, 否则用户填了"最多 5 首"会被通用上限顶掉。
+        limit = resolve_limit(ctx, 50, dedicated_keys=("max_audio",))
         subdir = str(ctx.config.get("subdir") or "music")
 
         collected: list[tuple[str, Optional[int]]] = []
