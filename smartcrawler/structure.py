@@ -85,14 +85,23 @@ _ANALYZE_JS = r"""
     // ---- 相对 scope 的子选择器(用于列表项字段推断) ----
     // 返回形如 "顶层tag.class 内层tag.class 最深层tag.class" 的后代选择器,
     // 比"仅最近祖先层"更精准(如 article.product_pod p.price_color)
+    //
+    // **不能因为"太深"就返回 null。** 这是一条踩过的坑: 早先这里最多向上走 5 层,
+    // 超过就放弃; 而 pixiv 作品卡片的封面图在第 7 层, 于是图片字段被静默丢弃 ——
+    // 用户看到的现象就是"样本 HTML 里明明有 <img>, 生成的规则却没有 image 键",
+    // 结果图片下载插件下不到任何图。深度不该是放弃的理由:
+    //   - 5 层内: 用完整路径(最准);
+    //   - 更深: 退化为"最近祖先 + 目标元素"两段式(如 "div.grid img"), 仍然可用且够稳;
+    //   - 只有连祖先都找不到时才返回 null。
     const tagClass = (el) => {
         const cls = selectorClasses(el);
         return el.tagName.toLowerCase() + (cls.length ? '.' + cls.map(cssEscape).join('.') : '');
     };
     const relSelector = (scope, el) => {
+        if (!scope || !el || el === scope) return null;
         const path = [];  // 从 el 向上到 scope 直接子节点之间的路径(不含顶层)
         let cur = el;
-        for (let i = 0; i < 5 && cur && cur !== scope; i++) {
+        for (let i = 0; i < 12 && cur && cur !== scope; i++) {
             if (cur.parentElement === scope) {
                 const parts = [tagClass(cur)];
                 for (let j = Math.min(path.length, 2) - 1; j >= 0; j--) parts.push(tagClass(path[j]));
@@ -101,7 +110,15 @@ _ANALYZE_JS = r"""
             path.push(cur);
             cur = cur.parentElement;
         }
-        return null;
+        // 超出层级预算: 退化为"最近祖先 + 目标" —— 保证字段不丢。
+        // 注意要保持后代关系(空格), 不能用 ' > ', 否则会要求直接的父子关系而匹配不到。
+        if (path.length >= 2) {
+            return tagClass(path[path.length - 1]) + ' ' + tagClass(el);
+        }
+        if (path.length === 1) {
+            return tagClass(el);
+        }
+        return tagClass(el);
     };
 
     // ---- 从样本列表项推断字段 ----
@@ -458,7 +475,23 @@ _ANALYZE_JS = r"""
                 text = ' ' + ((el.innerText || el.textContent || '')).trim().slice(0, 60).replace(/\s+/g, ' ');
             }
             const href = (tag === 'a' && el.getAttribute('href')) ? ' -> ' + el.getAttribute('href').slice(0, 80) : '';
-            lines.push(prefix + tag + id + cls + text + href);
+            // 图片也把地址带出来, 和链接的 ' -> href' 对称。
+            //
+            // 为什么必须带: 此前树里的图片行长这样 —— `img.kHdoFK`, 只有标签名和 class。
+            // 于是(a)人在树里根本看不出哪里有图片、哪个是数据图; (b)也没法用它判断
+            // 图片字段该指向哪。而 <a> 一直是带 href 的, 这个不对称纯属疏漏。
+            // 优先取懒加载属性, 与 sampleFields 的口径保持一致(很多图站 src 是占位图)。
+            let media = '';
+            if (tag === 'img' || tag === 'source') {
+                const LAZY = ['data-src', 'data-original', 'data-lazy-src', 'data-actualsrc', 'data-echo'];
+                const lazyAttr = LAZY.find(x => (el.getAttribute(x) || '').trim());
+                const u = lazyAttr ? el.getAttribute(lazyAttr) : (el.getAttribute('src') || el.getAttribute('srcset') || '');
+                if (u) media = (lazyAttr ? ' [' + lazyAttr + '] -> ' : ' -> ') + u.trim().split(/\s+/)[0].slice(0, 84);
+            } else if (tag === 'video' || tag === 'audio') {
+                const u = el.getAttribute('src') || '';
+                if (u) media = ' -> ' + u.slice(0, 84);
+            }
+            lines.push(prefix + tag + id + cls + text + href + media);
             nodes++;
             if (nodes >= maxNodes) {
                 truncated.nodes = true;
@@ -569,10 +602,14 @@ class StructureAnalyzer:
     ) -> Optional[ExtractionRule]:
         """根据结构报告生成默认提取规则(AI 不可用时的规则引擎降级方案)。
 
-        策略: 在"可推断字段 >= 2"的候选中综合评分:
-            score = 不同选择器数*4 + 字段数 + min(count, 20)
-        关键是"不同选择器数"的权重最高 —— 导航/侧边栏列表的各字段常来自同一元素
-        (如 title/link 都取自 <a>), 而真实数据列表(商品卡片)的字段来自不同元素。
+        评分策略(按重要性排序):
+            score = 不同选择器数*4 + 字段数 + min(count, 20) + **图片字段奖励(6)**
+
+        - "不同选择器数"权重最高: 导航/侧边栏列表的各字段常来自同一元素(如 title/link
+          都取自 <a>), 而真实数据列表(作品卡片/商品卡)的字段来自不同元素。
+        - **图片字段奖励是必须的**: 实测 pixiv 搜索页, 侧边栏"推荐标签"列表靠字段数
+          以 14:12 压过了真正的作品列表, 于是生成的规则里没有 image 键、图片插件下不到图。
+          对"抓图"这类目标来说, 有图片字段的候选几乎总是更该选的。
         """
         best: Optional[ListCandidate] = None
         best_score = -1.0
@@ -580,7 +617,15 @@ class StructureAnalyzer:
             if len(cand.sample_fields) < 2:
                 continue
             distinct = len({(f.get("selector"), f.get("attribute")) for f in cand.sample_fields})
+            has_image = any(
+                "image" in str(f.get("name", "")).lower()
+                or "thumb" in str(f.get("name", "")).lower()
+                or str(f.get("attribute", "")).lower() in ("src", "srcset", "data-src")
+                for f in cand.sample_fields
+            )
             score = distinct * 4 + len(cand.sample_fields) + min(cand.count, 20)
+            if has_image:
+                score += 6
             if score > best_score:
                 best, best_score = cand, score
         if best is None:

@@ -63,8 +63,23 @@ _KEYWORDS: tuple[tuple[str, str, str, float], ...] = (
     (r"地区(?:限制|不支持)|仅限(?:中国大陆|境内)访问|not\s+available\s+in\s+your\s+region", "地区限制", "risk_control", 0.6),
     # ---- 服务端错误 ----
     (r"服务(?:器)?(?:错误|异常|不可用)|内部错误|系统(?:繁忙|错误)|稍后重试", "服务端错误提示", "server_error", 0.5),
-    (r"(?:50[0-9])\s*(?:error|错误)?|bad\s+gateway|service\s+unavailable", "5xx 错误字样", "server_error", 0.6),
-    (r"找不到(?:页面|该页)|页面不存在|404|not\s+found", "页面不存在", "not_found", 0.5),
+    # 5xx 字样**必须带上下文**, 不能裸匹配三位数字。
+    #
+    # 踩过的坑: 原模式是 `(?:50[0-9])\s*(?:error|错误)?` —— "500" 后面什么都不用跟,
+    # 于是 pixiv 搜索页(「初音未来」投稿超过 **50** 万件、各种 500x 尺寸标记)被判成
+    # "5xx 错误字样 · 服务端错误 60%", 而那次请求的 HTTP 状态是 **200**。
+    # 用户看到"目标站点服务端错误"却明明能正常打开页面, 只能更困惑。
+    # 现在要求: 明确写成 HTTP 5xx / 5xx 字样紧跟错误词 / 标准的网关错误短语。
+    (
+        r"\b(?:http\s*)?5\d{2}\s*(?:internal\s+server\s+error|server\s+error|error|错误|异常)"
+        r"|\bhttp\s+5\d{2}\b"
+        r"|bad\s+gateway|service\s+(?:unavailable|temporarily\s+unavailable)"
+        r"|internal\s+server\s+error|网关错误|服务器内部错误",
+        "5xx 错误字样",
+        "server_error",
+        0.6,
+    ),
+    (r"找不到(?:页面|该页)|页面不存在|not\s+found", "页面不存在", "not_found", 0.5),
     # ---- 其它 ----
     (r"出错啦|出错了|发生错误|页面异常|something\s+went\s+wrong|an\s+error\s+occurred", "通用错误页", "unknown", 0.3),
     (r"需要(?:报名|加入|申请)|先(?:报名|加入)才(?:能|可)", "需要先报名/加入", "permission_denied", 0.55),
@@ -341,9 +356,21 @@ async def detect_access_issue(
         scores[kind] = scores.get(kind, 0.0) + weight
 
     # ---- 线索 1: 关键词 ----
+    #
+    # **HTTP 成功时不给"服务端错误"记账。** 这是本次踩到的坑: pixiv 搜索页正文里
+    # 出现了数字 "50"(「投稿超过 50 万件」之类), 命中了过于宽松的 5xx 模式, 于是
+    # HTTP **200** 的页面被判成"目标站点服务端错误 · 置信度 60%"。
+    #
+    # 判据上的道理很简单: 服务端真的 5xx 时, 请求本身就会拿到 5xx 状态码; 反过来,
+    # 拿到了 2xx 就说明服务端**正常响应了**, 正文里再出现 "500" 也只是页面内容。
+    # 保留"服务端错误提示"这类**文字型**线索(站点可能用 200 返回一个"系统繁忙"提示页),
+    # 但把纯粹的数字/状态码型线索在 2xx 下剔除。
+    server_ok = http_status is not None and 200 <= http_status < 300
     haystack = f"{issue.page_title}\n{issue.visible_text}\n{issue.main_text}"
     matched: list[str] = []
     for pattern, label, kind, weight in _KEYWORDS:
+        if server_ok and kind == "server_error" and label == "5xx 错误字样":
+            continue
         if re.search(pattern, haystack, re.IGNORECASE):
             matched.append(label)
             issue.reasons.append(label)
