@@ -39,6 +39,29 @@ DETECT_JS = r"""
     };
     const textOf = (el) => ((el.innerText || el.textContent || '')).trim().replace(/\s+/g, ' ');
 
+    // "存在于文档里"—— 比 visible() 宽松: **只要不是被刻意藏起来的**(visibility:hidden /
+    // opacity:0)就算存在, 不再要求有尺寸、也不要求在视口内。
+    //
+    // 为什么必须放宽到这一步(实测数据支撑):
+    //   pixiv 登录后, /logout /stacc /bookmark.php /history.php 等 8 个登录专属入口
+    //   **全部**在 DOM 里, 但**全部**处在 <div class="hidden">(display:none) 的响应式
+    //   容器中; 而匿名访问时这 8 个路径**一个都不存在**(只有 /login 与 /signup)。
+    //   也就是说: 这些路径"存在"本身就是服务端按登录用户渲染内容的证据, 与它当前
+    //   有没有被排版出来无关。于是之前的 visible() 判据把已登录页面判成了
+    //   "登录状态不明确 · 置信度 0%"。
+    //
+    // 刻意**不**排除 display:none: 那是站点做响应式最常见的隐藏方式(桌面版/移动版各留
+    // 一份 DOM), 被它隐藏的元素在另一种视口下就是可见的, 因此"存在"应当算数。
+    // 而 visibility:hidden / opacity:0 是"藏内容"的语义(如折叠面板), 仍按不存在处理。
+    const present = (el) => {
+        if (!el) return false;
+        for (let p = el; p && p !== document.documentElement; p = p.parentElement) {
+            const s = window.getComputedStyle(p);
+            if (s.visibility === 'hidden' || s.opacity === '0') return false;
+        }
+        return true;
+    };
+
     const collect = (selector, limit) => {
         const out = [];
         for (const el of document.querySelectorAll(selector)) {
@@ -57,25 +80,89 @@ DETECT_JS = r"""
     const chromeScope = document.querySelector('header, nav, [role="banner"], [class*="header" i], [class*="Header" i]');
     const scopeRoot = chromeScope || document.body;
 
+    // 头像候选: **必须同时是 <img> 且 src 像头像**。
+    //
+    // 两个真实误判教出来的教训:
+    //   1) 只按类名找会漏掉 pixiv 的真实头像(一个无 class 的 <img>, 父级是哈希类名);
+    //   2) 但把选择器放宽到"类名里带 user/icon 的任意元素"又会**误命中装饰性元素** ——
+    //      匿名首页有一个 <div class="BackgroundSlideshow_userIcon____rg1">(48x48 的背景
+    //      轮播图标), 它不是头像, 却让匿名页面白拿了 0.30 的已登录分。
+    // 所以判据是"img + src 特征 + 尺寸像头像", 三者缺一不可。
     const avatarSelectors = [
         '[class*="avatar" i] img', 'img[class*="avatar" i]',
         'img[class*="user-icon" i]', 'img[class*="userIcon" i]',
-        '[class*="user-icon" i]', '[class*="UserIcon" i]',
-        '[class*="userMenu" i]', '[class*="user-menu" i]', '[class*="AccountMenu" i]',
-        '[class*="account-menu" i]', '[aria-haspopup][class*="user" i]',
+        'img[class*="userIcon" i]',
+        '[class*="userMenu" i] img', '[class*="user-menu" i] img',
+        '[class*="AccountMenu" i] img', '[class*="account-menu" i] img',
+        'header img[src*="profile" i]', 'header img[src*="avatar" i]',
+        'nav img[src*="profile" i]',
     ];
+    // 头像判据: 有真实 src + 尺寸像头像(方形、24~96px)。
+    // 尺寸这一条是主力 —— 它能挡掉 logo(宽扁)与装饰图; src 关键词只作为额外佐证,
+    // 不能作为必要条件(pixiv 的头像 URL 里并没有 avatar/user 字样)。
+    const looksLikeAvatarSrc = (img) => {
+        const src = img.getAttribute('src') || '';
+        if (!src || src.startsWith('data:')) return false;
+        const r = img.getBoundingClientRect();
+        const squareish = Math.abs(r.width - r.height) <= 8;
+        const sizeOk = r.width >= 24 && r.width <= 96 && r.height >= 24 && r.height <= 96;
+        return squareish && sizeOk;
+    };
     let avatar = 0;
     for (const sel of avatarSelectors) {
         for (const el of scopeRoot.querySelectorAll(sel)) {
-            if (visible(el)) avatar++;
+            if (el.tagName.toLowerCase() !== 'img') continue;   // 排除装饰性 div/span
+            if (!visible(el)) continue;
+            if (!looksLikeAvatarSrc(el)) continue;
+            avatar++;
+        }
+    }
+    // 兜底: 页头/导航里"方形、24~96px、有真实 src"的图片。
+    // 只在确实存在语义化页头时启用 —— scopeRoot 退化成 body 时(有些站点没有
+    // <header>/<nav>, 实测 pixiv 匿名页就是)全页扫描会把内容区配图算成头像。
+    if (avatar === 0 && chromeScope) {
+        for (const img of scopeRoot.querySelectorAll('img')) {
+            if (img.tagName.toLowerCase() !== 'img') continue;
+            if (!visible(img)) continue;
+            if (!looksLikeAvatarSrc(img)) continue;
+            avatar++;
+            if (avatar >= 3) break;
         }
     }
 
     // "只属于我"的功能入口: 收藏/关注/设置/消息/我的作品。
     // 这些是登录后才存在的导航项, 比"页面上有用户链接"可靠得多。
-    const ownNavPattern = /(我的|個人|个人|收藏|关注|追蹤|消息|通知|设置|設定|bookmark|favorite|following|setting|notification|mypage|my-page|my\/)/i;
+    //
+    // **多语言是必需的**, 不是可选项: 站点按 locale 渲染不同文案, 漏掉某一种语言就会
+    // 在那种语境下完全失效。这里一开始只有中英文, 实测在 pixiv 上就漏了日文菜单。
+    //
+    // **不能只看 href**: 早先图省事加了 ``my\/`` 想匹配 /my/xxx, 结果任何含 "my/" 的
+    // URL 都命中; 中文"的作品"里的"作"甚至被 ``作品`` 匹配到画家名
+    // (实测匿名页命中『YUNA的作品』-> https://www.pixiv.net/users/7036095)。
+    // 所以: 文字用多语言关键词, href 只匹配**明确的账户路径**白名单。
+    const ownNavWords = /(我的|個人|个人|收藏|关注|追蹤|消息|通知|设置|設定|书签|浏览记录|动态|约稿|参加群组|作品管理|创作|マイページ|ブックマーク|フォロー|フォロワー|設定|通知|メッセージ|履歴|マンガ|小説|마이페이지|북마크|팔로우|설정|알림|bookmark|favorite|following|setting|notification|mypage)/i;
+    const ownNavHrefs = ['/bookmark', '/mypage', '/my/', '/settings', '/following',
+                         '/history', '/dashboard', '/stacc', '/marker_all',
+                         '/manage/', '/group/group_list', '/novel/marker'];
     const ownNavLinks = [...scopeRoot.querySelectorAll('a[href]')]
-        .filter(a => visible(a) && ownNavPattern.test((a.innerText || '') + ' ' + (a.getAttribute('href') || '')))
+        .filter(a => {
+            if (!visible(a)) return false;
+            const text = (a.innerText || '').trim();
+            const href = a.getAttribute('href') || '';
+            // 文字必须**自己**像"我的入口"(短标签), 避免匹配到画师名之类的长文本
+            if (text && text.length <= 12 && ownNavWords.test(text)) return true;
+            return ownNavHrefs.some(h => href.includes(h));
+        })
+        .map(a => ({ text: textOf(a).slice(0, 30), href: a.getAttribute('href') || '' }));
+
+    // 登录专属的**账户路径**: 这些 URL 只有登录用户才会被渲染出来, 与文案语言无关,
+    // 因此比文字匹配更稳。为了对抗"整块侧边栏被响应式容器隐藏", 这里用 present()
+    // 而不是 visible()。
+    const ACCOUNT_PATHS = ['/logout', '/stacc', '/dashboard', '/history.php',
+                           '/bookmark.php', '/novel/marker_all', '/manage/requests',
+                           '/group/group_list', '/settings', '/mypage'];
+    const accountPathLinks = [...document.querySelectorAll('a[href]')]
+        .filter(a => present(a) && ACCOUNT_PATHS.some(p => (a.getAttribute('href') || '').includes(p)))
         .map(a => ({ text: textOf(a).slice(0, 30), href: a.getAttribute('href') || '' }));
 
     // 登录/注册入口
@@ -87,9 +174,19 @@ DETECT_JS = r"""
         .map(f => f.getAttribute('action') || '')
         .filter(a => /login|signin|auth|accounts\./i.test(a));
 
-    // 退出登录入口
+    // 退出登录入口。两个改进都是必需的:
+    //   1) **同时看 href** —— pixiv 的退出是 <a href="/logout.php?return_to=%2F">, 只按
+    //      文案匹配时, 文案一旦是脚本渲染/非中英文就会漏掉; href 是结构性的, 更可靠;
+    //   2) 用 present() 而不是 visible() —— 同上, 整块侧边栏可能被判为不可见。
+    //   3) 日文 ログアウト / 韩文 로그아웃 一并覆盖。
     const logoutCount = [...document.querySelectorAll('a, button')]
-        .filter(el => visible(el) && /退出|登出|注销|log\s?out|sign\s?out/i.test(textOf(el)))
+        .filter(el => {
+            if (!present(el)) return false;
+            const t = textOf(el);
+            const h = el.getAttribute('href') || '';
+            return /退出|登出|注销|ログアウト|로그아웃|log\s?out|sign\s?out/i.test(t + ' ' + h)
+                || /\/logout/i.test(h);
+        })
         .length;
 
     const bodyText = (document.body ? (document.body.innerText || '') : '').slice(0, 20000);
@@ -111,11 +208,14 @@ DETECT_JS = r"""
         own_nav_count: ownNavLinks.length,
         own_nav: ownNavLinks.slice(0, 6),
         logout_count: logoutCount,
+        // 登录专属账户路径的命中数(与文案语言无关的结构性证据)
+        account_path_count: accountPathLinks.length,
+        account_paths: accountPathLinks.slice(0, 8),
         // 文案
-        // 未登录方向的信号。中英文都覆盖: 站点的语言取决于浏览器 locale, 只认中文会
-        // 在英文语境下漏判(pixiv 在无 locale 的默认上下文里就渲染英文引导页)。
-        has_login_prompt: /请先?登录|需要登录|登录后(才能)?|用\s*\S*\s*账号登录|注册账号|立即注册|免费注册|未登录|(log\s?in|sign\s?in)\s+(with|to|required)|please\s+(log\s?in|sign\s?in)|create\s+an?\s+account|sign\s?up\s+(for\s+)?free/i.test(bodyText),
-        has_account_prompt: /我的(主页|收藏|关注|账号|消息)|个人中心|账号设置|退出登录|我的作品|\bmy\s+(bookmarks|favorites|follow|account|profile|works|page)\b|log\s?out|sign\s?out/i.test(bodyText),
+        // 未登录方向的信号。中英日韩都覆盖: 站点的语言取决于浏览器 locale, 只认中文
+        // 会在其它语境下漏判(pixiv 在无 locale 的默认上下文里就渲染英文引导页)。
+        has_login_prompt: /请先?登录|需要登录|登录后(才能)?|用\s*\S*\s*账号登录|注册账号|立即注册|免费注册|未登录|ログイン(する|してください)|新規登録|(log\s?in|sign\s?in)\s+(with|to|required)|please\s+(log\s?in|sign\s?in)|create\s+an?\s+account|sign\s?up\s+(for\s+)?free/i.test(bodyText),
+        has_account_prompt: /我的(主页|收藏|关注|账号|消息)|个人中心|账号设置|退出登录|我的作品|マイページ|ブックマーク|フォロー中|ログアウト|\bmy\s+(bookmarks|favorites|follow|account|profile|works|page)\b|log\s?out|sign\s?out/i.test(bodyText),
         body_text: bodyText,
         // 正文长度: 供调用方判断"页面是否已经渲染出内容"(SPA 的引导文案是异步来的,
         // 采早了会得到"信号不足"的结论)。只暴露长度, 不把整段正文传回去。
@@ -144,6 +244,12 @@ _AUTH_SIGNALS: dict[str, float] = {
     "avatar": 0.30,           # 页头有头像/用户菜单
     "own_nav": 0.30,          # 页头有"我的收藏/关注/设置"这类仅登录后存在的入口
     "account_prompt": 0.25,   # 文案里有"我的收藏/个人中心"
+    # 登录专属**账户路径**(/logout /stacc /dashboard /bookmark.php …)。
+    # 与文案语言无关, 且不要求元素可见 —— 很多站点把侧边栏塞进响应式容器里整体隐藏,
+    # 但服务端**把登录用户的菜单吐出来了**这件事本身就是登录证据。实测 pixiv 正是
+    # 这种情况: 8 个登录专属入口都在 DOM 里, 却全部判为不可见, 于是已登录页面
+    # 得到"登录状态不明确 · 置信度 0%"。
+    "account_path": 0.35,
 }
 
 
@@ -225,6 +331,8 @@ def evaluate_login_state(
         "avatar_count": int(raw.get("avatar_count") or 0),
         "own_nav": int(raw.get("own_nav_count") or 0) > 0,
         "own_nav_count": int(raw.get("own_nav_count") or 0),
+        "account_path": int(raw.get("account_path_count") or 0) > 0,
+        "account_path_count": int(raw.get("account_path_count") or 0),
         "account_prompt": bool(raw.get("has_account_prompt")),
     }
     state.signals = signals
@@ -264,6 +372,11 @@ def evaluate_login_state(
         state.reasons.append(
             f"页头有 {signals['own_nav_count']} 个『仅登录后存在』的入口"
             "(收藏/关注/设置等)"
+        )
+    if signals.get("account_path"):
+        state.reasons.append(
+            f"页面渲染出 {signals['account_path_count']} 个登录专属入口"
+            "(退出登录/我的收藏/浏览记录等), 说明服务端已按登录用户返回内容"
         )
     if signals.get("account_prompt"):
         state.reasons.append("页面文案出现『我的收藏/个人中心』类入口")
