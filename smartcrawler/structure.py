@@ -87,19 +87,51 @@ _ANALYZE_JS = r"""
             const sel = tag + '.' + cls.map(cssEscape).join('.');
             if (document.querySelectorAll(sel).length === 1) return sel;
         }
+        // 兜底: 从目标往上拼一条 `A > B > C` 的路径。
+        //
+        // **遇到带 id 的祖先时, 必须把 id 当成"路径的一段", 不能就地收尾。**
+        // 这里出过一个隐蔽的严重缺陷(实测证据):
+        //   目标的真实结构是  body > div#__next > div > div > … > nav > a
+        //   走到 #__next 时若写成 `#__next > a`, 就等于断言 a 是 #__next 的**直接子级**,
+        //   而它其实在两层 div 之下 —— 生成的选择器**匹配 0 个元素**。
+        //   后果不只是"选择器不好用": 分页的 next_selector 就是这么生成的,
+        //   于是翻页点击永远超时, 界面显示"共 1 页", 而用户明明看到有翻页按钮。
+        //   正确做法: 把 '#' + id 塞进 parts, 让它成为链上的一环, 再 break。
         const parts = [];
         let cur = el, depth = 0;
         while (cur && cur.tagName && cur !== document.body && depth < 30) {
+            if (cur.id) {
+                parts.unshift('#' + cssEscape(cur.id));
+                // id 理论上唯一, 但**必须实测确认**: 站点重复 id 或页面里有
+                // 动态插入的同 id 节点时, 只有 id 的选择器也会匹配多个。
+                // 与上面几层一样, 验证通过才敢用。
+                const withId = parts.join(' > ');
+                try {
+                    if (document.querySelectorAll(withId).length === 1) return withId;
+                } catch (e) { /* 忽略 */ }
+                // 不唯一: 继续往上补层级, 让它更具体
+                cur = cur.parentElement;
+                depth++;
+                continue;
+            }
             let s = cur.tagName.toLowerCase();
-            if (cur.id) { parts.unshift('#' + cssEscape(cur.id) + ' > ' + s); break; }
             const parent = cur.parentElement;
             if (parent) {
                 const sameTag = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
                 if (sameTag.length > 1) s += ':nth-of-type(' + (sameTag.indexOf(cur) + 1) + ')';
             }
             parts.unshift(s);
+            // 拼出来的路径**必须实测唯一**才返回。
+            // 早先这里直接 return, 于是返回了一个匹配 0 个元素的"坏选择器" ——
+            // 调用方(翻页点击、字段提取)只会看到"点不动/提不到", 完全不知道是选择器的问题。
+            const built = parts.join(' > ');
+            try {
+                if (document.querySelectorAll(built).length === 1) return built;
+            } catch (e) { /* 忽略非法选择器, 继续往上 */ }
             cur = parent; depth++;
         }
+        // 一路走到 body 都不唯一: 返回最长的那条路径(至少是"能匹配到目标"的最具体描述),
+        // 而不是一个可能匹配 0 个的残缺路径。
         return parts.length ? parts.join(' > ') : tag;
     };
 

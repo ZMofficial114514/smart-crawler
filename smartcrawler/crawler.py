@@ -54,7 +54,7 @@ from .plugins.base import PluginContext
 from .plugins.manager import PluginManager
 from .storage import Storage, load_state, save_state, update_seen_hashes
 from .structure import StructureAnalyzer
-from .utils import stable_hash
+from .utils import stable_hash, truncate
 
 #: 这些访问受限类型意味着"当前页面根本不是目标内容", 提取它只会拿到错误页的导航/页脚。
 #: 注意 ``empty_page`` / ``spa_shell`` 不在其中 —— 那两种情况页面本身是正常内容, 只是
@@ -84,15 +84,73 @@ def _page_has_content(report: Optional[PageStructureReport]) -> bool:
     证据优先级: 有候选列表 > 链接/图片数量足够多。用"事实"而不是"诊断推断"来决定
     要不要继续提取 —— duitang 就是典型: 诊断看到密码框判 login_required, 但页面上
     有 230 个链接和 55 张图, 内容其实完全可抓。
+
+    **但"有候选列表"这一条不能无条件成立。** 实测(洛谷 401 页): 错误页的
+    **页脚导航**也会被识别成候选列表, 于是框架兴冲冲提取出 7 条"图片上传/云剪贴板/
+    主题商店/咕值排名…" —— 全是站点工具链接, 与用户要的数据毫无关系。
+    这比"0 条"更糟: 用户以为抓到了东西。
+
+    所以要在"有候选"之外再加一道**质量判据**:
+      - 候选里含图片字段, 或
+      - 候选条目数达到一定规模(页脚导航通常只有几条到十几条), 或
+      - 候选的条目选择器带语义标记(article/product/card/item/post/…),
+        **且**不是纯导航容器(nav/footer/aside/header/menu/breadcrumb)。
+    三条都不满足时, 即使有候选也按"没有可抓内容"处理。
     """
     if report is None:
         return False
     if report.candidate_lists:
-        return True
+        if any(_candidate_looks_like_data(c) for c in report.candidate_lists):
+            return True
+        # 候选全是导航性质的: 不据此认为有内容, 继续看链接/图片的数量
     stats = report.dom_stats or {}
     links = int(stats.get("links") or 0)
     images = int(stats.get("images") or 0)
     return links >= _MIN_CONTENT_LINKS or images >= _MIN_CONTENT_IMAGES
+
+
+#: 条目选择器里出现这些词, 通常意味着"数据卡片"而非导航菜单
+_DATA_HINTS = (
+    "article", "product", "card", "item", "post", "entry", "result",
+    "thumb", "figure", "media", "video", "story", "list-item", "goods",
+)
+#: 出现这些词则明确是导航/页脚/侧栏
+_NAV_HINTS = (
+    "nav", "footer", "aside", "header", "menu", "breadcrumb", "sidebar",
+    "toolbar", "pagination", "pager", "tag-list", "social",
+)
+#: 条目少于此数时, 除非有图片字段, 否则不足以证明"页面有数据"
+_MIN_DATA_ITEMS = 8
+
+
+def _candidate_looks_like_data(cand: Any) -> bool:
+    """判断一个候选列表是否"像数据区", 而不是站点导航/页脚菜单。
+
+    存在的意义: 拦截页上唯一"结构完整"的东西往往就是页脚导航。把它当数据提取,
+    会把错误页的菜单当成抓取结果 —— 实测洛谷 401 页就是这么产出 7 条垃圾的。
+    """
+    fields = getattr(cand, "sample_fields", None) or []
+    # 有图片字段 -> 基本可以确定是数据卡片(导航栏极少带图)
+    if any(
+        "image" in str(f.get("name", "")).lower()
+        or "thumb" in str(f.get("name", "")).lower()
+        or str(f.get("attribute", "")).lower() in ("src", "srcset", "data-src")
+        for f in fields
+    ):
+        return True
+
+    selector = str(getattr(cand, "item_selector", "") or "").lower()
+    container = str(getattr(cand, "container_selector", "") or "").lower()
+    haystack = f"{selector} {container}"
+
+    # 明确的导航容器 -> 直接判否(除非上面已因图片字段通过)
+    if any(h in haystack for h in _NAV_HINTS):
+        return False
+    # 语义化的数据标记 -> 判是
+    if any(h in haystack for h in _DATA_HINTS):
+        return True
+    # 兜底: 条目够多也算(页脚菜单通常很短)
+    return int(getattr(cand, "count", 0) or 0) >= _MIN_DATA_ITEMS
 
 COMPLIANCE_NOTICE = (
     "SmartCrawler 合规提示: 请确保目标网站允许采集(robots.txt / 服务条款), "
@@ -372,6 +430,19 @@ class SmartCrawler:
 
                 # ---------- 7. 首页提取 ----------
                 await self.plugins.run_async("before_extract", ctx, only=plugin_ids)
+                # 先等选择器真的命中(SPA 在 network_settle 之后才渲染出列表的情况下,
+                # 直接提取会得到 0 条, 而用户完全不知道只是"还没渲染好")
+                if not await self._wait_for_items(page, rule):
+                    logger.warning(
+                        f"等待 {8.0}s 后 item_selector 仍未匹配到元素: "
+                        f"{truncate(str(rule.list_rule.item_selector), 80)}"
+                    )
+                    if on_progress:
+                        on_progress(
+                            "WARNING",
+                            "等待 8 秒后仍没有匹配到列表项 —— 可能是页面渲染更慢, "
+                            "或规则与当前页面结构不符(可增大「额外等待」或重新分析)",
+                        )
                 items = await self._extract_current(page, rule)
                 result.pages_crawled = 1
                 logger.info(f"第 1 页提取 {len(items)} 条")
@@ -599,6 +670,48 @@ class SmartCrawler:
             return items
         return await self.extractor.extract_with_rule(page, rule)
 
+    async def _wait_for_items(
+        self,
+        page,
+        rule: ExtractionRule,
+        *,
+        timeout: float = 8.0,
+        interval: float = 0.4,
+    ) -> bool:
+        """等 item_selector 真的匹配到元素, 返回是否等到。
+
+        **为什么需要它**: 文档里给的等待(`network_settle`, 默认 2.5s)对静态站足够,
+        但对 SPA 是"猜时长"。实测 pixiv 搜索页: 同一个选择器, 分析时匹配 60 项,
+        而某次抓取在 2.5s 时页面还没渲染出结果区, 提取到 0 条 ——
+        用户看到"抓取到 0 条"却不知道只是慢了半秒, 图片插件反而把图都下下来了
+        (它有自己的取图路径), 于是现象自相矛盾: 图有了、数据没有。
+
+        这里是**等事实**而不是等时长: 轮询 `item_selector` 是否已匹配到元素, 一旦匹配
+        立刻返回(所以正常页面不会变慢), 直到超时才放弃并把结论交给上层。
+        """
+        if not rule.list_rule or not rule.list_rule.item_selector:
+            return False
+        selector = rule.list_rule.item_selector
+        deadline = time.monotonic() + max(0.0, timeout)
+        first = True
+        while True:
+            try:
+                n = await page.evaluate(
+                    "(sel) => { try { return document.querySelectorAll(sel).length } "
+                    "catch (e) { return -1 } }",
+                    selector,
+                )
+            except Exception:  # noqa: BLE001 - 页面正在导航时会短暂失败
+                n = -1
+            if isinstance(n, int) and n > 0:
+                if not first:
+                    logger.info(f"等待生效: 第 {n} 个元素出现(选择器 {truncate(selector, 60)})")
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            first = False
+            await asyncio.sleep(interval)
+
     async def _retry_json_with_ai(self, rule: ExtractionRule) -> list[dict[str, Any]]:
         """json 模式兜底: 把最大的 JSON 响应交给 AI 重新分析字段。"""
         json_records = self.recorder.json_records()
@@ -638,6 +751,12 @@ class SmartCrawler:
                 break
             await self.browser.wait_for_load_state(page, "domcontentloaded", timeout=20.0)
             await asyncio.sleep(min(self.settings.crawler.network_settle, 6.0))
+
+            # 翻页后同样等"新内容真的到位"。SPA 翻页只是改 URL + 重渲染,
+            # domcontentloaded 早就过了, 固定睡 2.5s 经常睡在骨架态上 ——
+            # 那样提取到的还是旧内容, 去重后表现为"本页无新增"。
+            if not await self._wait_for_items(page, rule):
+                logger.warning(f"翻到第 {page_no} 页后仍未匹配到列表项, 仍尝试提取")
 
             # 插件: 每翻完一页(可在此对新页面做懒加载触发/注入)
             if ctx is not None:
