@@ -118,6 +118,10 @@ class PageStructureReport(BaseModel):
     generated_at: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     simplified_tree: str = Field(default="", description="简化 DOM 树(文本形式, 有节点数上限)")
+    simplified_tree_truncated: bool = Field(
+        default=False,
+        description="结构树是否因深度/节点上限被截断(界面据此显示『已截断』徽标)",
+    )
     candidate_lists: list[ListCandidate] = Field(default_factory=list, description="候选列表区")
     pagination: Optional[PaginationInfo] = None
     metadata: dict[str, Any] = Field(

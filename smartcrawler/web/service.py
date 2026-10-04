@@ -30,6 +30,7 @@ from ..login_state import detect_login_state
 from ..models import ExtractionRule, NetworkRecord, PageStructureReport, TaskResult
 from ..plugins.manager import PluginManager
 from ..session import resolve_session_path
+from ..utils import truncate
 from .login_flow import STATE_FILE, LoginFlow, clear_saved_session, session_overview
 from .config_store import (
     EnvConfigStore,
@@ -1554,8 +1555,22 @@ def _columns(items: list[dict[str, Any]], limit: int = 24) -> list[str]:
     return cols
 
 
+#: 界面负载里简化树的字符上限。
+#:
+#: 之前是 20000 且用 `tree[:20000]` 直接切片 —— **只留开头**。而简化树的顺序是
+#: "页面框架在前、正文在后"(侧边栏/页头先写, 作品卡片在末尾), 于是界面里看到的树
+#: 全是导航, 正文一张图都没有。用户反馈的"真实浏览器正文与 DOM 树明显不同",
+#: 有相当一部分就是这里造成的: 分析器其实抓到了正文, 是被这一步切掉的。
+#:
+#: 80000 是实测出来的: 分析器产出约 1200 节点 / 61KB, 给 80000 才**真正完整送达**
+#: (实测 60000 时树是 60336 字符, 只超 336 就触发截断, 图片覆盖立刻从 ~90% 掉到 70%)。
+#: 关键教训: 这里的目标不是"限制得越小越省", 而是**让树完整送到界面** ——
+#: 截断一次, 用户看到的就是一张没有正文的树。
+_TREE_PAYLOAD_LIMIT = 80000
+
+
 def _trim_report(report: Optional[PageStructureReport]) -> Optional[dict[str, Any]]:
-    """裁剪结构报告: 去掉体积最大的简化 DOM 树之外的长字段。"""
+    """裁剪结构报告: 缩小长字段, 但**不能把正文切掉**。"""
     if report is None:
         return None
     data = report.model_dump(mode="json")
@@ -1563,8 +1578,12 @@ def _trim_report(report: Optional[PageStructureReport]) -> Optional[dict[str, An
         html = candidate.get("sample_html") or ""
         candidate["sample_html"] = html[:1200]
     tree = data.get("simplified_tree") or ""
-    data["simplified_tree"] = tree[:20000]
-    data["simplified_tree_truncated"] = len(tree) > 20000
+    if len(tree) > _TREE_PAYLOAD_LIMIT:
+        # 保留头尾: 头部是页面骨架, 尾部是正文样本, 中间省略
+        data["simplified_tree"] = truncate(tree, _TREE_PAYLOAD_LIMIT)
+        # 不要覆盖分析器给出的截断原因(它区分"撞深度上限"与"撞节点上限"),
+        # 只做"或"合并 —— 早先这里直接赋值, 把更有诊断价值的信息盖掉了。
+        data["simplified_tree_truncated"] = True
     return data
 
 

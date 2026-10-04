@@ -270,7 +270,10 @@ class AIEngine:
             "candidate_lists": candidates,
             "pagination": report.pagination.model_dump() if report.pagination else None,
             "metadata_json_ld": truncate(json.dumps(report.metadata.get("json_ld", []), ensure_ascii=False), 2000),
-            "simplified_dom_tree": truncate(report.simplified_tree, 4000),
+            # 8000 字符(此前 4000): 树里现在带着正文的图片/作品链接, 是生成
+            # 列表规则与 image 字段的主要依据, 给太少就只能看到导航。
+            # truncate 已改为**保留头尾**, 所以即使超限也不会把正文整段丢掉。
+            "simplified_dom_tree": truncate(report.simplified_tree, 8000),
             "html_sample": truncate(html_sample, 2000),
         }
         messages = [

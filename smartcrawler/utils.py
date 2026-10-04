@@ -344,10 +344,26 @@ def parse_regex_selector(selector: str) -> Optional[re.Pattern[str]]:
 # 其他
 # ---------------------------------------------------------------------------
 def truncate(text: Optional[str], limit: int) -> str:
-    """安全截断字符串用于日志/Prompt。"""
+    """安全截断字符串用于日志/Prompt。
+
+    **保留头尾, 不只保留开头。** 这一点很重要, 而且踩过:
+
+    简化 DOM 树的结构是"页面框架在前、正文在后"(侧边栏/页头写在前面, 作品卡片在末尾)。
+    早先这里只取 ``text[:limit]``, 于是喂给 AI 的 4000 字符**全是导航** —— 正文一张图
+    一个作品链接都进不了 prompt, AI 自然生成不出截图里那种列表规则。
+    改成头尾各留一半后, 正文样本得以保留。
+
+    对日志类调用(URL、报错文本)同样安全: 它们通常远短于 limit, 走的是原样返回分支。
+    """
     if text is None:
         return ""
-    return text if len(text) <= limit else text[:limit] + f"...[截断, 原长 {len(text)}]"
+    if len(text) <= limit:
+        return text
+    marker = f"\n...[中间省略 {len(text) - limit} 字符, 已保留头尾]...\n"
+    keep = max(0, limit - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return text[:head] + marker + (text[-tail:] if tail else "")
 
 
 def ensure_dir(path: str | "Path") -> "Path":  # type: ignore[name-defined]

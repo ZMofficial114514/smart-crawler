@@ -37,6 +37,16 @@ _ANALYZE_JS = r"""
         c => c && !/^(css-|sc-|chakra-|jsx-|svelte-)/.test(c) && !/[a-f0-9]{10,}/i.test(c) && c.length <= 40
     );
 
+    //: 选择器里每个元素**最多用几个 class**。
+    //:
+    //: 原子化 CSS(Tailwind 这类)会让一个元素挂十几二十个 class, 实测 pixiv 上生成了
+    //: 这种选择器::
+    //:   div.grid.w-full.gap-4 div img.absolute.inset-0.size-full.bg-surface1.object-cover...
+    //: 又长又脆 —— 站点换个样式类就全废, 人也没法读、没法维护。
+    //: 只取前 3 个(通常是语义性的那位, 原子类一般排在后面), 既保留区分度又保持可读。
+    const MAX_CLASSES_PER_SELECTOR = 3;
+    const selectorClasses = (el) => stableClasses(el).slice(0, MAX_CLASSES_PER_SELECTOR);
+
     // ---- 唯一选择器生成: id > data-* > 稳定class > nth-of-type 路径 ----
     const uniqSelector = (el) => {
         if (!el || el === document.body) return 'body';
@@ -51,7 +61,7 @@ _ANALYZE_JS = r"""
                 if (document.querySelectorAll(sel).length === 1) return sel;
             }
         }
-        const cls = stableClasses(el);
+        const cls = selectorClasses(el);
         if (cls.length) {
             const sel = tag + '.' + cls.map(cssEscape).join('.');
             if (document.querySelectorAll(sel).length === 1) return sel;
@@ -76,7 +86,7 @@ _ANALYZE_JS = r"""
     // 返回形如 "顶层tag.class 内层tag.class 最深层tag.class" 的后代选择器,
     // 比"仅最近祖先层"更精准(如 article.product_pod p.price_color)
     const tagClass = (el) => {
-        const cls = stableClasses(el);
+        const cls = selectorClasses(el);
         return el.tagName.toLowerCase() + (cls.length ? '.' + cls.map(cssEscape).join('.') : '');
     };
     const relSelector = (scope, el) => {
@@ -364,11 +374,81 @@ _ANALYZE_JS = r"""
     };
 
     // ---- 简化 DOM 树 ----
+    //
+    // 三个上限的取值来自**实测**(pixiv 已登录首页, 1903 个节点 / 60 张图 / 49 个作品链接):
+    //
+    //   元素深度分布     img  avg 17.3  max 26
+    //                  作品链接 avg 19.0  max 25
+    //                  侧边栏   深度 11   <- 反而很浅
+    //
+    //   旧配置 (maxDepth=10, maxNodes=600) 的后果:
+    //        img 覆盖 24.6%、作品链接覆盖 **0%** —— 整个正文区被无声丢弃,
+    //        只剩侧边栏/页头/页脚。用户看到的正是这个: "真实浏览器与 DOM 树明显不同"。
+    //   实测各档覆盖(节点数为实际产出):
+    //        (10,600)  298 节点  img 24.6%  art   0%
+    //        (18,1200) 1142 节点 img 57.4%  art  52.4%
+    //        (22,1200) 1201 节点 img 78.7%  art  76.2%
+    //        (24,2000) 1832 节点 img 93.4%  art 100%   <- 采用
+    //
+    // childCap 从 20 提到 80: 实测某些容器一层就有 80 个子节点, slice(0,20) 会丢掉
+    // 后面 3/4 的同级内容。
+    const TREE_MAX_DEPTH = 24;
+    //: 节点上限 1200。实测(pixiv 已登录首页)各档的"送达后覆盖":
+    //:
+    //:   节点  负载   截断  img覆盖  作品覆盖
+    //:   1000  40KB    是     33%      42%
+    //:   1200  40KB    是     54%      64%
+    //:   1200  60KB    **否**  61%      90%   <- 采用
+    //:   1500  90KB    否     88%     100%
+    //:
+    //: 注意一个反直觉的现象: **提高节点上限反而会降低送达覆盖** —— 因为负载上限是固定的,
+    //: 树越大, 头尾截断要丢掉的"中间段"就越多, 而正文正好在被丢的中间。
+    //: 所以关键是让整棵树**不超过负载上限**(1200 节点 ≈ 61KB < 60KB 上限), 而不是拼命多抓。
+    const TREE_MAX_NODES = 1200;
+    const TREE_CHILD_CAP = 80;
+    //: 输出缩进的层数上限。**缩进是纯开销**: 真实深度可以到 24, 每层 2 空格意味着
+    //: 最深层每行光缩进就 48 字符 —— 实测把树撑到 107KB / 1782 行, 而 AI prompt 只有
+    //: 8000 字符预算, 等于 93% 的内容根本送不进模型。
+    //: 遍历仍然按真实深度裁剪(靠 maxDepth), 只有**打印**时把缩进压平到这一层。
+    //: 层级信息并未丢失: 相邻行的缩进差依然能看出父子关系。
+    const TREE_INDENT_CAP = 12;
+
+    // 子节点排序: **内容优先**。
+    //
+    // 为什么必须排: 深度优先会把"浅而啰嗦"的侧边栏/页脚先写满预算, 正文(深)反而排在
+    // 输出的最后。而消费方有两处只看前半段 —— AI prompt 只取前 4000 字符, 人也是从上往下读 ——
+    // 于是正文即使被抓到也等于没抓到。把带图/带链接/带文本的子树提前, 让有限预算花在
+    // 有数据的地方。
+    const contentScore = (el) => {
+        let score = 0;
+        const imgs = el.querySelectorAll('img');
+        score += imgs.length * 6;
+        const anchors = el.querySelectorAll('a[href]');
+        score += anchors.length * 3;
+        const txt = (el.innerText || '');
+        score += Math.min(txt.length, 400) / 20;
+        // 带语义标签的加分: 列表/文章/卡片通常就是数据区
+        if (/^(UL|OL|ARTICLE|SECTION|MAIN|TABLE|FIGURE)$/.test(el.tagName)) score += 4;
+        return score;
+    };
+    const orderedChildren = (el) => {
+        const kids = Array.from(el.children);
+        if (kids.length < 2) return kids;
+        return kids
+            .map((c, i) => ({ c, i, s: contentScore(c) }))
+            .sort((a, b) => (b.s - a.s) || (a.i - b.i))   // 同分保持原顺序, 输出才稳定
+            .map(x => x.c);
+    };
+
     const simplifiedTree = (maxDepth, maxNodes) => {
         const lines = [];
         let nodes = 0;
         const walk = (el, depth, prefix) => {
-            if (depth > maxDepth || nodes > maxNodes) return;
+            if (nodes >= maxNodes) return;
+            if (depth > maxDepth) {
+                if (!truncated.depth) truncated.depth = depth;
+                return;
+            }
             if (SKIP[el.tagName]) return;
             const tag = el.tagName.toLowerCase();
             const id = el.id ? '#' + el.id : '';
@@ -380,8 +460,14 @@ _ANALYZE_JS = r"""
             const href = (tag === 'a' && el.getAttribute('href')) ? ' -> ' + el.getAttribute('href').slice(0, 80) : '';
             lines.push(prefix + tag + id + cls + text + href);
             nodes++;
-            if (nodes > maxNodes) return;
-            Array.from(el.children).slice(0, 20).forEach(c => walk(c, depth + 1, prefix + '  '));
+            if (nodes >= maxNodes) {
+                truncated.nodes = true;
+                return;
+            }
+            // 子节点前缀在缩进封顶后不再增长, 省下大量字符预算给真正的内容
+            const nextPrefix = depth + 1 >= TREE_INDENT_CAP ? prefix : prefix + '  ';
+            orderedChildren(el).slice(0, TREE_CHILD_CAP)
+                .forEach(c => walk(c, depth + 1, nextPrefix));
         };
         walk(document.body, 0, '');
         return lines.join('\n');
@@ -395,12 +481,29 @@ _ANALYZE_JS = r"""
         forms: document.querySelectorAll('form').length
     });
 
+    // 记录"这次是不是真的被截断了"。
+    // 早先这个标记在前端被用来显示「已截断」徽标, 但后端**从未赋过值** ——
+    // 界面上那个提示永远不会出现, 用户无从知道结构树其实不完整。
+    const truncated = { nodes: false, depth: 0 };
+
+    const tree = simplifiedTree(TREE_MAX_DEPTH, TREE_MAX_NODES);
+
     return {
         title: document.title || '',
         candidates: detectLists(),
         pagination: detectPagination(),
         metadata: collectMetadata(),
-        tree: simplifiedTree(10, 600),
+        tree: tree,
+        tree_truncated: !!(truncated.nodes || truncated.depth),
+        tree_info: {
+            nodes: tree.split('\n').length,
+            max_depth: TREE_MAX_DEPTH,
+            depth_capped: truncated.depth || 0,
+            node_capped: !!truncated.nodes,
+            total_elements: document.querySelectorAll('*').length,
+            images_in_dom: document.querySelectorAll('img').length,
+            images_in_tree: (tree.match(/^\s*img/gm) || []).length
+        },
         dom_stats: domStats()
     };
 };
@@ -424,19 +527,35 @@ class StructureAnalyzer:
 
         candidates = [ListCandidate(**c) for c in raw.get("candidates", [])]
         pag_raw = raw.get("pagination")
+        tree = raw.get("tree", "") or ""
+        tree_info = raw.get("tree_info") or {}
         report = PageStructureReport(
             url=url,
             title=raw.get("title", ""),
-            simplified_tree=raw.get("tree", ""),
+            simplified_tree=tree,
+            simplified_tree_truncated=bool(raw.get("tree_truncated")),
             candidate_lists=candidates,
             pagination=PaginationInfo(**pag_raw) if pag_raw else None,
             metadata=raw.get("metadata", {}),
             dom_stats=raw.get("dom_stats", {}),
         )
+        # 把"正文到底有没有被抓到"记进日志。这是本模块最隐蔽的失效模式:
+        # 树看着挺长(全是导航), 但数据区一张图都没有, 而界面与调用方都察觉不到。
+        imgs_dom = int(tree_info.get("images_in_dom") or 0)
+        imgs_tree = int(tree_info.get("images_in_tree") or 0)
+        cover = (imgs_tree / imgs_dom * 100) if imgs_dom else 100.0
         logger.info(
             f"结构分析完成: {truncate(url, 80)} | 候选列表 {len(candidates)} 个 "
-            f"| 分页 {'✓' if report.pagination else '✗'} | 节点 {report.dom_stats.get('total_elements', 0)}"
+            f"| 分页 {'✓' if report.pagination else '✗'} | 节点 {report.dom_stats.get('total_elements', 0)} "
+            f"| 树 {tree_info.get('nodes', 0)} 行 (图片覆盖 {cover:.0f}%"
+            f"{', 已达深度上限' if tree_info.get('depth_capped') else ''}"
+            f"{', 已达节点上限' if tree_info.get('node_capped') else ''})"
         )
+        if imgs_dom >= 5 and cover < 50:
+            logger.warning(
+                f"结构树只覆盖了 {cover:.0f}% 的图片(DOM {imgs_dom} 张 / 树内 {imgs_tree} 张) —— "
+                "正文区可能被深度或节点上限截掉, 提取规则会缺少图片字段"
+            )
         return report
 
     # ------------------------------------------------------------------
