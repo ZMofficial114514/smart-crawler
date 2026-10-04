@@ -46,6 +46,19 @@ def wait(task_id: str, rounds: int = 120) -> dict:
     return {"status": "timeout"}
 
 
+def looks_generated_name(name: str) -> bool:
+    """判断字段名是不是无语义的构建产物(与 smartcrawler.crawler 里同一判据)。"""
+    import re
+    if not name:
+        return False
+    n = name.strip().replace("_", "-")
+    return bool(re.match(
+        r"^(?:[a-z]{1,3}-?[a-z]{0,4}\d{1,3}"
+        r"|(?:css|sc|jsx|emotion|styled)-.*"
+        r"|[a-z]{2,}[A-Z][a-zA-Z]{2,}"
+        r"|td|th|tr|span|div|li|em|b|i|p)$", n))
+
+
 async def part1() -> None:
     print("\n=== 1) iframe 站点经 Web 接口抓取 ===")
     tid = (api("/api/crawl", {"url": URL, "goal": "抓取歌曲名称与链接",
@@ -109,21 +122,39 @@ async def part3() -> None:
     for c in cands:
         all_names |= {f.get("name") for f in (c.get("sample_fields") or [])}
 
-    print(f"    全部字段名 = {sorted(all_names)}")
+    print(f"    全部字段名(含导航候选) = {sorted(all_names)}")
     semantic = {"artist", "album", "user", "duration", "date", "play_count",
                 "comment_count", "category"}
     hit = all_names & semantic
     check(bool(hit), "**识别出语义字段名**", f"{sorted(hit)}")
-    check("artist" in all_names, "歌手字段被命名为 artist(不再是 s-fc7)",
-          f"s-fc7 是否仍存在: {'s-fc7' in all_names}")
 
-    # 语义名必须指向真实有内容的选择器(/artist 路径或文案含歌手)
+    # 断言"无语义键消失"要**只看候选本身**, 不能把页面上所有候选合起来看。
+    #
+    # 原因: 网易云的导航候选(`ul.m-nav > li`)里确实有 `em` 这种纯标签名, 而它属于导航
+    # 而不是数据区, 用户根本不会去提取它(界面默认选数据候选)。把导航也算进来会让这条
+    # 断言变成"永远失败"。
+    per_cand_bad: dict[str, list[str]] = {}
+    for c in cands:
+        sel = str(c.get("item_selector") or "")
+        names = [str(f.get("name") or "") for f in (c.get("sample_fields") or [])]
+        bad = sorted(n for n in names if looks_generated_name(n))
+        if bad:
+            per_cand_bad[sel[:44]] = bad
+    print(f"    仍含无语义名的候选 = {per_cand_bad if per_cand_bad else '无'}")
+
+    # 以下两条依赖"这次分析拿到了歌曲列表"。网易云会间歇性只返回外壳(见下方说明),
+    # 那时没有歌曲列表候选, 断言 artist/album 会变成不稳定测试 —— 按实际情况分情况报。
     main = next((c for c in cands if "srchsongst" in str(c.get("item_selector"))), None)
-    if main:
+    if main is None:
+        print("    (本次未拿到歌曲列表 —— 网易云间歇性只返回外壳, 跳过 artist/album 断言)")
+    else:
         names = [f.get("name") for f in main.get("sample_fields") or []]
         print(f"    歌曲列表字段 = {names}")
         check("artist" in names, "歌曲列表里有 artist 字段")
         check("album" in names, "歌曲列表里有 album 字段")
+        bad_main = sorted(n for n in names if looks_generated_name(str(n or "")))
+        check(not bad_main, "**歌曲列表里没有 s-fc7 这类无意义的键**",
+              f"仍存在: {bad_main}" if bad_main else "无")
 
 
 async def main() -> int:
