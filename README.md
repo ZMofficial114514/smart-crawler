@@ -135,6 +135,39 @@ anchor iframe, 但只有部分情况会弹出挑战(实测未挑战时该 iframe
 > 人机验证的设计目的即为拦截自动化。这里只保存服务端签发的会话凭据。
 > 接口只返回掩码摘要(Cookie 数量、域名、名称), 不回传值; 会话文件已在 `.gitignore`。
 
+> **新克隆的仓库里没有登录会话**: `data/session.json` 与 `data/sessions/` 都在
+> `.gitignore` 中(会话等同于凭据, 绝不入库), 因此 clone 下来后该文件不存在,
+> 需要自行登录一次。抓取需要登录的站点(pixiv、网易云等)前请先走上面的手动登录。
+
+## 开发与贡献
+
+> 完整说明见 [CONTRIBUTING.md](CONTRIBUTING.md): 环境准备、自检脚本、验收脚本写法、
+> 提交信息规范与常见坑。
+
+### 1. 必须手动启用仓库自带的提交钩子
+
+仓库在 `.githooks/` 下带了 `pre-push` 钩子, 推送前会扫描即将推送的内容里有没有密钥
+(`.env`、token 之类)。**Git 出于安全考虑不会自动启用克隆下来的钩子**, 每个新克隆
+都必须手动执行一次, 否则这道防线是关着的:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+装好后的效果: `git push` 前自动跑 `scripts/check_no_secrets.py`, 命中疑似凭据即中止
+推送。确实误报时可用 `git push --no-verify` 跳过。
+
+### 2. 提交前自检
+
+```bash
+python scripts/check_version.py        # 版本号唯一来源是否同步
+python scripts/check_changelog.py      # CHANGELOG 的事实性声明与代码是否一致
+python scripts/check_no_secrets.py     # 别把密钥提交进来
+python scripts/check_plugin_docs.py    # docs/plugins.md 与代码是否脱节
+```
+
+`python -m smartcrawler web` 启动控制台, `start.bat --reload` 可开自动重载。
+
 ## 插件系统
 
 两条并行的扩展路径:
@@ -154,6 +187,7 @@ anchor iframe, 但只有部分情况会弹出挑战(实测未挑战时该 iframe
 |---|---|---|
 | 图片下载器 | 启用 | 从记录字段或页面 `img` 下载图片; 并发限流、大小上限、最小宽度过滤 |
 | 音乐下载器 | 关闭 | 下载 `audio`/`source` 或音频字段; 可按同名只保留最大文件 |
+| 视频下载器 | 关闭 | 下载 `video` 元素或视频字段; m3u8/mpd 交给 ffmpeg 合并, 落盘后校验 MP4 索引 |
 | 反爬增强 | 关闭 | 注入请求头、模拟滚动节奏、补充 webdriver 伪装、识别拦截页 |
 | 声明式扩展 | 关闭 | 免代码配置下载、补字段、额外导出 |
 | 示例: 补充字段 | 关闭 | 用户插件编写模板 |
@@ -165,6 +199,8 @@ anchor iframe, 但只有部分情况会弹出挑战(实测未挑战时该 iframe
 > 配置项类型、辅助函数、完整示例、排错对照表与提交前自检清单。
 > 该文档由 `python scripts/check_plugin_docs.py` 核对代码 —— 校验接口是否存在、
 > 签名是否一致、示例能否运行。
+>
+> 改动框架本身(而不只是写插件)请先看 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 核心能力
 
