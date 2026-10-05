@@ -8,10 +8,12 @@
 验收点:
 
 1. 普通 ``.m4a`` 直链照旧能下(改造不能碰坏原有路径);
-2. ``m3u8`` 地址必须交给 ffmpeg 合并成**可播放的音频容器**(这里用魔数 + ``moov``
+2. **带 ID3v2 标签的 mp3 必须被认出来** —— 真实 mp3 绝大多数以 ``ID3`` 开头, 魔数表
+   漏了它就会把已经下好的文件判成"无法识别"并删除(音乐站点直链下载的典型形态);
+3. ``m3u8`` 地址必须交给 ffmpeg 合并成**可播放的音频容器**(这里用魔数 + ``moov``
    索引判定, 不调用 ffprobe);
-3. 产物目录里**不允许出现 .m3u8 / 播放列表文本**;
-4. ``hls_enabled=False`` 时明确跳过并告警, 同样不产出假文件。
+4. 产物目录里**不允许出现 .m3u8 / 播放列表文本**;
+5. ``hls_enabled=False`` 时明确跳过并告警, 同样不产出假文件。
 
 用法: python scripts/verify_audio_stream.py
 """
@@ -75,6 +77,16 @@ def build_fixtures(ff: str) -> dict[str, Path]:
         check=True, timeout=180,
     )
 
+    # mp3 直链: 绝大多数真实 mp3 以 ID3v2 标签开头 —— 魔数判定必须认它,
+    # 否则已经下好的文件会被"无法识别"误杀(见文件头注释里的真实故障)。
+    tagged_mp3 = FIX / "tagged.mp3"
+    subprocess.run(
+        [ff, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "sine=frequency=523:duration=2",
+         "-c:a", "libmp3lame", "-b:a", "128k", str(tagged_mp3)],
+        check=True, timeout=180,
+    )
+
     # HLS 音频: 切成 1 秒的分片 + 播放列表(只留音频, 模拟音乐站点)
     subprocess.run(
         [ff, "-hide_banner", "-loglevel", "error", "-y",
@@ -86,7 +98,11 @@ def build_fixtures(ff: str) -> dict[str, Path]:
         check=True, timeout=180,
     )
 
-    return {"direct": direct, "playlist": FIX / "playlist.m3u8"}
+    return {
+        "direct": direct,
+        "tagged_mp3": tagged_mp3,
+        "playlist": FIX / "playlist.m3u8",
+    }
 
 
 def serve(directory: Path):
@@ -152,7 +168,7 @@ def audio_ok(path: Path) -> tuple[bool, str]:
     with path.open("rb") as fh:
         head = fh.read(64)
     kind = sniff_kind(head)
-    if kind not in ("mp4", "m4a", "matroska", "mpegts", "ogg"):
+    if kind not in ("mp4", "m4a", "mp3", "matroska", "mpegts", "ogg"):
         return False, f"魔数不像音视频容器(识别为 {kind}, 头 {head[:8].hex(' ')})"
     if kind in ("mp4", "m4a"):
         tail = path.read_bytes()[-2 * 1024 * 1024:]
@@ -195,7 +211,26 @@ async def main() -> int:
             check(ok, "产物是合法音频容器", detail)
 
         # ==============================================================
-        print("\n[2] m3u8 流应交给 ffmpeg 合并(而不是存下播放列表)")
+        print("\n[2] **带 ID3 标签的 mp3 直链必须放行(魔数识别回归)**")
+        clean_output()
+        ctx, downloads, msgs = make_ctx(base_config())
+        await plugin.after_extract(ctx, [{"audio": f"{base}/tagged.mp3"}])
+        for lv, msg in msgs:
+            print(f"      [{lv}] {msg}")
+        files = listing()
+        check(len(downloads) == 1 and downloads[0].ok, "mp3 记录为成功",
+              str([(r.ok, r.error) for r in downloads]))
+        check(len(files) == 1, "**产物没有被误判删除**", str(files))
+        if files:
+            check(files[0].endswith(".mp3"), "落成 .mp3", files[0])
+            with (MUSIC_DIR / files[0]).open("rb") as fh:
+                head = fh.read(8)
+            check(head[:3] == b"ID3", "样本确实是 ID3 开头的 mp3", head.hex(" "))
+            ok, detail = audio_ok(MUSIC_DIR / files[0])
+            check(ok, "**ID3 开头的 mp3 被识别为合法音频容器**", detail)
+
+        # ==============================================================
+        print("\n[3] m3u8 流应交给 ffmpeg 合并(而不是存下播放列表)")
         clean_output()
         ctx, downloads, msgs = make_ctx(base_config())
         await plugin.after_extract(ctx, [{"audio": f"{base}/playlist.m3u8"}])
@@ -217,7 +252,7 @@ async def main() -> int:
                   files[0])
 
         # ==============================================================
-        print("\n[3] hls_enabled=False: 明确跳过, 不产出任何假文件")
+        print("\n[4] hls_enabled=False: 明确跳过, 不产出任何假文件")
         clean_output()
         ctx, downloads, msgs = make_ctx(base_config(hls_enabled=False))
         await plugin.after_extract(ctx, [{"audio": f"{base}/playlist.m3u8"}])
@@ -228,7 +263,7 @@ async def main() -> int:
               str([m for _lv, m in msgs]))
 
         # ==============================================================
-        print("\n[4] 播放列表混在记录里时, 直链与流式各走各的路")
+        print("\n[5] 播放列表混在记录里时, 直链与流式各走各的路")
         clean_output()
         ctx, downloads, msgs = make_ctx(base_config())
         await plugin.after_extract(
