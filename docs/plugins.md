@@ -68,12 +68,6 @@ python -m smartcrawler web      # 控制台默认 http://127.0.0.1:8322
 
 也可以点「插件」页的**新建插件**,让界面直接生成骨架文件。
 
----
-
-\\python
-def on_page(self, ctx, page_no):
-    pass
-\
 ## 2. 三条硬性准则
 
 这三条不是风格偏好,违反它们会造成真实故障:
