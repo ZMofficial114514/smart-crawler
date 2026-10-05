@@ -156,6 +156,48 @@ def _quiet_library():
             os.close(devnull)
 
 
+def _safe_name(text: str, limit: int = 80) -> str:
+    """把歌名/歌手变成安全的文件名片段。"""
+    text = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (text or "").strip())
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text[:limit]
+
+
+def _rename_with_metadata(record: Any, meta: dict[str, str]) -> None:
+    """把下载产物按「歌手 - 歌名」重命名。
+
+    默认文件名是 ``<url 哈希>_<哈希>.mp3``, 对用户等于没有信息 —— 下 20 首之后完全无法
+    辨认哪首是哪首。抓取结果里本来就有歌名与歌手, 顺手用上即可。
+    """
+    path = Path(record.path or "")
+    if not path.is_file():
+        return
+    artist = _safe_name(meta.get("artist") or "", 60)
+    title = _safe_name(meta.get("title") or "", 80)
+    if not title and not artist:
+        return
+    stem = f"{artist} - {title}" if (artist and title) else (title or artist)
+    if not stem:
+        return
+    target = path.with_name(f"{stem}{path.suffix}")
+    if target == path:
+        return
+    # 同名(同名歌曲/同歌手多版本)时加序号, 不覆盖已有文件
+    n = 2
+    while target.exists():
+        target = path.with_name(f"{stem} ({n}){path.suffix}")
+        n += 1
+        if n > 50:
+            return
+    try:
+        path.rename(target)
+    except OSError as exc:
+        logger.debug(f"重命名失败({path.name}): {exc}")
+        return
+    record.path = str(target)
+    record.filename = target.name
+
+
 class NeteaseMusicPlugin(BasePlugin):
     """用登录会话从网易云换取音频直链并下载(默认关闭)。"""
 
@@ -244,25 +286,46 @@ class NeteaseMusicPlugin(BasePlugin):
     # 取址
     # ------------------------------------------------------------------
     @staticmethod
-    def _collect_song_ids(ctx: PluginContext, items: list[dict[str, Any]]) -> list[tuple[str, int]]:
-        """从记录里收集 (歌曲 id, 记录序号), 保持顺序并去重。
+    def _collect_song_ids(
+        ctx: PluginContext, items: list[dict[str, Any]]
+    ) -> list[tuple[str, int, dict[str, str]]]:
+        """从记录里收集 (歌曲 id, 记录序号, 元数据), 保持顺序并去重。
 
         **不往 PluginContext 上挂临时属性**: 那是插件之间的公共对象, 随手加字段会和别的
         插件(或未来版本的基类)撞名, 也让"插件能改什么"变得不可控。需要的数据直接传参。
+
+        顺带把歌名/歌手一起带出来 —— 抓取结果里本来就有, 用来给下载文件命名,
+        否则产物只能叫一串哈希, 下多了根本认不出哪首是哪首。
         """
         configured = str(ctx.config.get("item_field") or "").strip()
         fields = [configured] if configured else ["link", "url", "song_url", "song_link",
                                                  "song_id", "id", "href"]
-        out: list[tuple[str, int]] = []
+        out: list[tuple[str, int, dict[str, str]]] = []
         seen: set[str] = set()
-        for field in fields:
-            for raw, index in urls_from_items(items, field):
+        for idx, item in enumerate(items):
+            sid = ""
+            for field in fields:
+                raw = item.get(field)
+                if raw is None:
+                    continue
+                if isinstance(raw, (int, float)):
+                    raw = str(int(raw))
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
                 sid = _song_id_from_url(absolute_url(ctx.url, raw))
-                if not sid and str(raw).strip().isdigit():
-                    sid = str(raw).strip()
-                if sid and sid not in seen:
-                    seen.add(sid)
-                    out.append((sid, index if index is not None else len(out)))
+                if not sid and raw.strip().isdigit():
+                    sid = raw.strip()
+                if sid:
+                    break
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            meta = {
+                k: str(item.get(k) or "").strip()
+                for k in ("title", "song_name", "name", "artist", "artists", "album")
+                if item.get(k)
+            }
+            out.append((sid, idx, meta))
         return out
 
     def _fetch_urls(
@@ -286,7 +349,7 @@ class NeteaseMusicPlugin(BasePlugin):
         found: dict[str, dict[str, Any]] = {}
         with _quiet_library():
             api = api_cls()
-            for sid, _index in song_ids:
+            for sid, _index, _meta in song_ids:
                 if sid in found:
                     continue
                 for level in levels:
@@ -323,13 +386,14 @@ class NeteaseMusicPlugin(BasePlugin):
     # ------------------------------------------------------------------
     async def _download_direct(
         self, ctx: PluginContext, urls: list[tuple[str, Optional[int]]],
-        subdir: str, max_bytes: int,
+        subdir: str, max_bytes: int, meta_by_index: dict[int, dict[str, str]] | None = None,
     ) -> list:
-        """直链下载(网易云正常情况下走这条) + 落盘后的容器校验。
+        """直链下载(网易云正常情况下走这条) + 落盘后的容器校验 + 按歌名重命名。
 
         **Referer 必须带上**: 网易云的 CDN 会校验来源, 缺 Referer 时返回 403 ——
         这不是"防盗链误伤", 而是它明确要求的请求头。
         """
+        meta_by_index = meta_by_index or {}
         results = await download_many(
             ctx,
             urls,
@@ -353,6 +417,10 @@ class NeteaseMusicPlugin(BasePlugin):
                 record.path = str(actual)
                 record.filename = actual.name
                 record.size = actual.stat().st_size
+                # 用抓取结果里的歌名/歌手命名, 否则产物只有一串哈希, 下多了认不出
+                idx = getattr(record, "source_item_index", None)
+                if idx is not None and idx in meta_by_index:
+                    _rename_with_metadata(record, meta_by_index[idx])
                 continue
             record.ok = False
             record.error = f"完整性校验未通过: {problem}"
@@ -408,10 +476,10 @@ class NeteaseMusicPlugin(BasePlugin):
         subdir = str(ctx.config.get("subdir") or "music")
         max_bytes = int(ctx.config.get("max_file_size_mb") or 80) * 1024 * 1024
 
-        # 文件名用 "歌手 - 歌名" 更可读, 由 _media 的 URL 命名兜底; 这里把 id 带上避免重名
         direct: list[tuple[str, Optional[int]]] = []
         streams: list[str] = []
-        index_of = {sid: idx for sid, idx in song_ids}
+        index_of = {sid: idx for sid, idx, _meta in song_ids}
+        meta_by_index = {idx: meta for _sid, idx, meta in song_ids}
         for sid, info in found.items():
             url = info["url"]
             if is_stream_url(url):
@@ -420,7 +488,8 @@ class NeteaseMusicPlugin(BasePlugin):
                 direct.append((url, index_of.get(sid)))
 
         if direct:
-            await self._download_direct(ctx, direct, subdir, max_bytes)
+            await self._download_direct(ctx, direct, subdir, max_bytes,
+                                        meta_by_index=meta_by_index)
         if streams:
             ctx.notify("INFO", f"网易云下载器: {len(streams)} 个地址是流式(m3u8/mpd), 交给 ffmpeg")
             await download_streams(
@@ -436,7 +505,7 @@ class NeteaseMusicPlugin(BasePlugin):
                 max_bytes=max_bytes,
             )
 
-        missing = [sid for sid, _ in song_ids if sid not in found]
+        missing = [sid for sid, _idx, _meta in song_ids if sid not in found]
         if missing:
             ctx.notify(
                 "WARNING",
