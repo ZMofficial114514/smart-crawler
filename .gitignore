@@ -46,3 +46,10 @@ desktop.ini
 # 登录会话等同于凭据, 绝不入库
 data/session.json
 data/sessions/
+
+# ---------- 内置二进制工具 ----------
+# tools/ 放"项目内自带"的第三方可执行文件(如 ffmpeg, 约 170MB)。
+# 绝不入库: 一是体积, 二是各平台二进制不同, 应由使用者按需下载(见 CONTRIBUTING.md)。
+tools/
+**/ffmpeg.exe
+**/ffprobe.exe
