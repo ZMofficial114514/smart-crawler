@@ -17,12 +17,21 @@
 
 > 各版本要点。技术细节见下方条目。
 
+### v1.2.1
+
+- 音乐下载器支持流式音频: 音频地址是 m3u8/mpd 时交给 ffmpeg 合并成**可播放的容器**。
+  原先只会把几 KB 的播放列表当音频存下来, 记录里还显示成功 —— 这类假成功比失败更糟。
+- 流式处理与"落盘后把关"抽到 `_media_stream.py` 由音频/视频下载器共用, 避免两份
+  m3u8 逻辑各自漂移; 视频下载器行为不变。
+
 ### v1.2.0
 
 - 修复下载撞大小上限时留下半成品: 路径改为写盘前登记, 异常清理才真正生效;
   新增 `Content-Length` 预检, 并把报错里的尺寸换成人类可读单位。
+- 音乐下载器支持流式音频: 音频地址是 m3u8/mpd 时交给 ffmpeg 合并成可播放的容器
+  (原先只会把几 KB 的播放列表当音频存下来, 记录还显示成功)。
 - 新增视频下载器: mp4/webm 直链走框架下载, m3u8/mpd 交给 ffmpeg 转封装;
-  落盘后按文件魔数纠正扩展名并校验 MP4 的 `moov` 索引, 不完整即删除并标记失败。
+  两者落盘后都按文件魔数纠正扩展名并做完整性校验, 不完整即删除并标记失败。
 
 ### v1.1.0
 
@@ -65,6 +74,58 @@
 - 多实例清理范围限定为自身进程链 (原会终止其他实例的浏览器)。
 - 浏览器失效时自动重建并重试。
 - 新增推送前密钥检查。
+
+## [1.2.1] — 2026-10-05
+
+音乐下载器支持流式音频(m3u8 / mpd): 交给 ffmpeg 合并成可播放的容器, 不再把播放列表
+文本当成下载成功。
+
+### 1. 音乐下载器支持流式音频(m3u8 / mpd) —— 修静默的假成功
+
+`smartcrawler/plugins/builtin/music_downloader.py` 原先只有一条路径: 拿到 URL 就交给
+框架的 `download_many` 流式 GET 落盘。音乐站点(网易云这类)的音频地址越来越常是
+HLS(`m3u8`)或 `mpd` 分片 —— 于是下载下来的"音频"实际是几 KB 的**播放列表文本**,
+而记录里是成功。这类假成功比失败更糟: 失败会重试, 假成功不会。
+
+现在按地址分流:
+
+- **mp4 / m4a / mp3 直链** —— 照旧走 `download_many`(带 Referer 防盗链);
+- **m3u8 / mpd 流** —— 交给 ffmpeg `-c copy` 转封装, 不重编码; 找不到 ffmpeg 就
+  **明确跳过并告警**, 绝不产出假文件。
+
+新增配置项: `hls_enabled`(默认开)、`ffmpeg_path`(留空自动查找项目内 `tools/ffmpeg`
+与系统 PATH)、`ffmpeg_timeout_s`。
+
+同时把"落盘后把关"补到**直链路径**上 —— 原先音频直链不做任何校验, 被截断的 mp4
+(文件头仍是合法的 `ftyp`)会被当成成功:
+
+- **扩展名按文件魔数判定**, 不按 URL 后缀 —— 否则 `/clip.php?id=1` 这类地址会把音频
+  存成 `.php`; 容器与扩展名不符时(实际是 MKV 却按 `.m4a` 落盘)一并判失败, 因为
+  播放器会照着扩展名解析;
+- **校验 MP4 的 `moov` 索引原子**; MP4 容器在音频场景落 `.m4a`。
+- 不通过校验的文件会被**删除并标记失败**, 不会留在磁盘上冒充产物。
+
+合规提醒不变: 音频多受版权保护, 请仅在拥有授权的前提下使用本插件。
+
+### 2. 共用流处理: `_media_stream.py`
+
+流式处理(ffmpeg 拉流 + 转封装)与"落盘后把关"抽到
+`smartcrawler/plugins/builtin/_media_stream.py`, 由视频下载器与音乐下载器共用,
+避免两份 m3u8 处理逻辑各自漂移(含 `-headers` / `-user_agent` 的按协议注入: 它们是
+http 协议的私有选项, 对本地 `file:` 输入加上会让 ffmpeg 直接报
+`Option headers not found`)。**视频下载器的对外行为不变**, `scripts/verify_video_integrity.py`
+照旧全部通过。
+
+### 验收
+
+- 新增 `scripts/verify_audio_stream.py`(本次主验收, 13 项, 离线可跑): 直链 `.m4a`
+  照旧下载 / **m3u8 必须被合并成能通过魔数与 `moov` 校验的音频容器** / 产物里不允许
+  出现 `.m3u8` 播放列表 / `hls_enabled=False` 时明确跳过且不产出假文件 /
+  直链与流式混在同一条记录里各走各的路。
+- 回归: `check_version` 通过(1.2.1)、`check_changelog` 通过、
+  `check_plugin_docs` 111/111、`check_no_secrets` 通过、
+  `verify_audio_stream` 13/13、`verify_media_truncation` 15/15、
+  `verify_video_integrity` 全部通过、`selfcheck --e2e` 通过。
 
 ## [1.2.0] — 2026-10-05
 
@@ -132,6 +193,52 @@
   `check_plugin_docs` 111/111、`check_no_secrets` 通过、
   `verify_media_truncation` 15/15、`verify_video_integrity` 全部通过、
   `selfcheck --e2e` 通过; 插件管理器可正常加载内置插件(含新增的 video-downloader)。
+
+
+`smartcrawler/plugins/builtin/_media.py` 的 `download_many` 有个顺序错误:
+异常路径的清理依赖 `record.path`, 而 `record.path` 是在**写盘成功之后**才赋值的。
+于是流式写入中途撞上 `max_file_size` 抛异常时, 清理分支看到 `path` 为空直接跳过,
+磁盘上就留下一个体积巨大、结构不完整、却"看起来下载过"的残片。
+
+真实事故: 512 MiB 的残片(大小恰好等于当时的 `max_file_size_mb: 512`),
+`ffprobe` 报 `moov atom not found` —— 播不了, 但记录里是成功。
+
+三处改动:
+
+- 写入**前**登记 `record.path` / `record.relative_path` / `record.filename`,
+  让异常路径的清理真正生效;
+- 新增 `Content-Length` 预检: 服务端已声明超限时连一个字节都不写; 大小判断由
+  "先写后判"改为"先判断再写", 不再写出"上限 + 1 个 chunk"的残片;
+- 新增 `_human_size()`: 原实现把字节整除成 MB, 1 MiB 以下一律显示 `0MB`,
+  让"到底差多少"完全看不出来。
+
+### 4. 文档
+
+- 新增 `CONTRIBUTING.md`, 并补上"必须手动执行 `git config core.hooksPath .githooks`"
+  这一步: Git 不会自动启用克隆下来的钩子, 不执行的话密钥扫描这道防线是关着的;
+- 说明新克隆的仓库里没有 `data/session.json`(会话等同于凭据, 已在 `.gitignore`),
+  抓取需要登录的站点前要自行登录一次;
+- 移除 `docs/plugins.md` 里一段围栏损坏的残留代码块(它把第 2 节整节吞进了代码块,
+  并示范了错误的 `on_page` 签名)。
+
+### 验收
+
+- 新增 `scripts/verify_audio_stream.py`(本次音频需求的主验收, 13 项): 直链 `.m4a`
+  照旧下载 / **m3u8 必须被合并成能通过魔数与 `moov` 校验的音频容器** /
+  产物里不允许出现 `.m3u8` 播放列表 / `hls_enabled=False` 时明确跳过且不产出假文件 /
+  直链与流式混在同一条记录里各走各的路。
+- 新增 `scripts/verify_media_truncation.py`: 本地靶站 + **不声明** Content-Length 的
+  流式响应, 覆盖"不留残片 / 预检不建文件 / 未超限正常落盘 / 尺寸格式化"。
+  刻意避开 Content-Length 是为了让"写了一半"的路径可测 ——
+  修复前 4 项失败, 修复后 15/15 通过。
+- 新增 `scripts/verify_video_integrity.py`(5 个场景, 含"截断的 mp4 必须被拦下")与
+  `scripts/selfcheck.py`(环境/依赖/插件/浏览器/ffmpeg 自检, `--e2e` 真造一个 HLS
+  流让插件合并一遍), 两者都离线可跑。
+- 回归: `check_version` 通过(1.2.0)、`check_changelog` 通过、
+  `check_plugin_docs` 111/111、`check_no_secrets` 通过、
+  `verify_audio_stream` 13/13、`verify_media_truncation` 15/15、
+  `verify_video_integrity` 全部通过、`selfcheck --e2e` 通过;
+  插件管理器可正常加载内置插件(含新增的 video-downloader)。
 
 ## [1.1.0] — 2026-10-04
 
