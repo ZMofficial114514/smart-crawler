@@ -83,7 +83,7 @@ git config core.hooksPath .githooks
 
 ```text
 fix: 下载撞大小上限时不再留下半成品
-feat: 新增视频下载器(m3u8/mpd 交给 ffmpeg 合并)
+feat: 音乐下载器支持流式音频(m3u8/mpd 交给 ffmpeg 合并)
 docs: README 补充启用提交钩子的步骤
 ```
 

@@ -6,10 +6,10 @@
 2. **m3u8 / mpd 流** —— 交给 ffmpeg 拉流并转封装(``-c copy``, 不重编码)。
 
 关于第 2 点的取舍: 框架自带的下载器只会"流式 GET 然后写盘", 遇到 m3u8 会把播放
-列表(几 KB 文本)当成功结果存下来 —— 这是静默的错误结果。因此这里显式分流:
-检测到流地址就走 ffmpeg, 检测不到 ffmpeg 就**明确跳过并告警**, 绝不产出假文件。
+列表(几 KB 文本)当成功结果存下来 —— 这是静默的错误结果。因此这里显式分流: 检测到
+流式地址就走 ffmpeg, 检测不到 ffmpeg 就**明确跳过并告警**, 绝不产出假文件。
 
-落盘后的两重把关(都源于一次真实事故: 512MiB 的残片被当成下载成功):
+落盘后的两重把关(详见 :mod:`._media_stream`, 音频下载器复用同一套):
 
 - **扩展名按文件魔数判定**, 不再回退到 URL 路径 —— 否则 ``/foo.php?id=1`` 这类
   地址会把视频存成 ``.php``, 后续没人认得出来;
@@ -22,158 +22,52 @@ ffmpeg 查找顺序: 插件配置 ``ffmpeg_path`` > 项目内 ``tools/ffmpeg/ffm
 
 from __future__ import annotations
 
-import asyncio
-import shutil
 from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
 
-from smartcrawler.config import PROJECT_ROOT
-from smartcrawler.models import DownloadedFile
-from smartcrawler.plugins.base import BasePlugin, PluginContext
-from smartcrawler.plugins.builtin._media import (
-    absolute_url,
-    download_many,
-    urls_from_dom,
+from ...models import DownloadedFile
+from ..base import BasePlugin, PluginContext
+from ._media import absolute_url, download_many, urls_from_dom
+from ._media_stream import (
+    MOOV_SCAN_BUDGET,
+    download_streams,
+    is_stream_url,
+    resolve_renamed,
+    verify_media_file,
 )
+from ._media_stream import find_ffmpeg as _find_ffmpeg_impl
 
 #: 常见的视频字段名(用户规则里的命名各不相同, 这里做一次兜底尝试)
 _VIDEO_FIELD_CANDIDATES = ("video", "video_url", "src", "media", "url")
 
-#: 需要 ffmpeg 才能处理的流式容器
-_STREAM_SUFFIXES = (".m3u8", ".mpd")
-
-#: 扩展名与 MIME 的映射: 魔数命中后从这里取规范名
-_MAGIC_EXT = {
-    "mp4": (".mp4", "video/mp4"),
-    "matroska": (".webm", "video/webm"),
-    "mpegts": (".ts", "video/mp2t"),
-    "flv": (".flv", "video/x-flv"),
-    "avi": (".avi", "video/x-msvideo"),
-    "ogg": (".ogv", "video/ogg"),
-    "webp": (".webp", "image/webp"),
-    "png": (".png", "image/png"),
-    "jpeg": (".jpg", "image/jpeg"),
+#: 各容器的落盘扩展名与 MIME(视频场景: mp4 容器落 ``.mp4``)
+_VIDEO_EXT: dict[str, str] = {
+    "mp4": ".mp4",
+    "matroska": ".webm",
+    "mpegts": ".ts",
+    "flv": ".flv",
+    "ogg": ".ogv",
 }
 
-#: 每个文件最多扫多少字节找 ``moov``(先头后尾, 足够覆盖绝大多数 mp4)
-_MOOV_SCAN_BUDGET = 6 * 1024 * 1024
+#: 兼容旧引用/自检脚本: 每个文件最多扫多少字节找 ``moov``
+_MOOV_SCAN_BUDGET = MOOV_SCAN_BUDGET
 
 
 def _find_ffmpeg(configured: str = "") -> Optional[str]:
-    """定位可用的 ffmpeg 可执行文件。"""
-    if configured:
-        p = Path(configured)
-        if p.is_file():
-            return str(p)
-        found = shutil.which(configured)
-        if found:
-            return found
-        return None
-
-    bundled = PROJECT_ROOT / "tools" / "ffmpeg" / "ffmpeg.exe"
-    if bundled.is_file():
-        return str(bundled)
-
-    return shutil.which("ffmpeg")
-
-
-def _sniff_kind(path: Path, head: bytes) -> Optional[str]:
-    """按文件魔数判断容器类型; 认不出返回 None。
-
-    顺序有讲究: ``ftyp`` 出现在偏移 4(前面是 box size), 必须先于通用判断。
-    """
-    if len(head) < 12:
-        return None
-    if head[4:8] == b"ftyp":
-        return "mp4"
-    if head[:4] == b"\x1a\x45\xdf\xa3":
-        # Matroska 与 WebM 同族, 这里统一按 webm 扩展名落盘
-        return "matroska"
-    if head[0] == 0x47 and len(head) > 188 * 2 and head[188] == 0x47:
-        return "mpegts"
-    if head[:3] == b"FLV":
-        return "flv"
-    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
-        return "avi"
-    if head[:4] == b"OggS":
-        return "ogg"
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "webp"
-    if head[:8] == b"\x89PNG\r\n\x1a\n":
-        return "png"
-    if head[:3] == b"\xff\xd8\xff":
-        return "jpeg"
-    return None
-
-
-def _has_moov(path: Path, budget: int = _MOOV_SCAN_BUDGET) -> bool:
-    """MP4 里是否存在 ``moov`` 原子(即索引是否写全)。
-
-    先查头部再查尾部 —— ``moov`` 按 faststart 与否位于文件两端之一, 这两处覆盖了
-    绝大多数真实文件, 因此不必为每个文件扫描整个 512MiB。
-    """
-    total = path.stat().st_size
-    with path.open("rb") as fh:
-        head = fh.read(min(budget, total))
-        if b"moov" in head:
-            return True
-        tail_size = min(budget, total)
-        fh.seek(max(0, total - tail_size))
-        return b"moov" in fh.read(tail_size)
+    """定位可用的 ffmpeg 可执行文件(自检脚本会直接调用这个名字)。"""
+    return _find_ffmpeg_impl(configured)
 
 
 def _resolve_renamed(path: Path) -> Path:
-    """``_verify_downloaded`` 可能纠正过扩展名, 这里找回改名后的真实路径。
-
-    优先返回原路径(未改名的情况); 找不到时按已知容器后缀逐个试探。
-    """
-    if path.exists():
-        return path
-    for ext, _mime in _MAGIC_EXT.values():
-        candidate = path.with_suffix(ext)
-        if candidate.exists():
-            return candidate
-    return path
+    """``_verify_downloaded`` 可能纠正过扩展名, 这里找回改名后的真实路径。"""
+    return resolve_renamed(path)
 
 
-def _verify_downloaded(path: Path, budget: int = _MOOV_SCAN_BUDGET) -> Optional[str]:
-    """校验落盘文件; 通过返回 ``None``, 不通过返回原因(并改好扩展名)。
-
-    只做**廉价且高价值**的检查: 魔数是否可辨认、mp4 索引是否完整。
-    不调用 ffprobe —— 那需要子进程与完整解码, 代价远高于收益。
-
-    注意: 纠正扩展名后**必须继续做后续校验**, 不能提前返回 —— 否则
-    ``/foo.php`` 这类地址会因为"改完名就放行"而跳过 moov 检查。
-    """
-    if not path.exists() or path.stat().st_size == 0:
-        return "文件为空"
-
-    with path.open("rb") as fh:
-        head = fh.read(64)
-
-    kind = _sniff_kind(path, head)
-    if kind is None:
-        return f"无法识别的文件类型(文件头 {head[:8].hex(' ')})"
-
-    ext, _mime = _MAGIC_EXT[kind]
-
-    # 扩展名纠偏: URL 以 .php/.asp 结尾时, 改回真实容器后缀
-    if path.suffix.lower() != ext:
-        fixed = path.with_suffix(ext)
-        if fixed.exists():
-            return f"目标扩展名已存在, 未能纠正 {path.name} -> {fixed.name}"
-        try:
-            path.rename(fixed)
-        except OSError as exc:
-            return f"扩展名纠正失败: {exc}"
-        path = fixed  # 继续校验改名后的文件
-
-    if kind == "mp4" and not _has_moov(path, budget):
-        return "MP4 缺少 moov 索引(文件被截断, 无法播放)"
-
-    return None
+def _verify_downloaded(path: Path, budget: int = MOOV_SCAN_BUDGET) -> Optional[str]:
+    """校验落盘文件; 通过返回 ``None``, 不通过返回原因(并改好扩展名)。"""
+    return verify_media_file(path, ext_for_kind=_VIDEO_EXT, budget=budget)
 
 
 class VideoDownloaderPlugin(BasePlugin):
@@ -298,23 +192,26 @@ class VideoDownloaderPlugin(BasePlugin):
             return items
 
         # 分流: 流式容器 vs 普通直链
-        streams = [u for u in unique if self._is_stream(u)]
+        streams = [u for u in unique if is_stream_url(u)]
         direct = [u for u in unique if u not in streams]
 
         if direct:
             await self._download_direct(ctx, direct[:limit], subdir)
 
         if streams:
-            await self._handle_streams(ctx, streams[:limit], subdir)
+            await download_streams(
+                ctx,
+                streams[:limit],
+                plugin_id=self.id,
+                subdir=subdir,
+                ext_for_kind=_VIDEO_EXT,
+                default_ext=".mp4",
+                hls_enabled=bool(ctx.config.get("hls_enabled", True)),
+                ffmpeg_path=str(ctx.config.get("ffmpeg_path") or ""),
+                timeout=int(ctx.config.get("ffmpeg_timeout_s") or 600),
+            )
 
         return items
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _is_stream(url: str) -> bool:
-        from urllib.parse import urlparse
-
-        return urlparse(url).path.lower().endswith(_STREAM_SUFFIXES)
 
     async def _download_direct(
         self, ctx: PluginContext, urls: list[str], subdir: str
@@ -350,10 +247,11 @@ class VideoDownloaderPlugin(BasePlugin):
                 continue
             record.ok = False
             record.error = f"完整性校验未通过: {problem}"
-            try:
-                Path(record.path).unlink(missing_ok=True)
-            except OSError:
-                pass
+            for candidate in {Path(record.path), _resolve_renamed(Path(record.path))}:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
             record.path = ""
             record.size = 0
             logger.warning(f"[{self.id}] 丢弃不完整文件 {record.url}: {problem}")
@@ -363,106 +261,6 @@ class VideoDownloaderPlugin(BasePlugin):
         elif results:
             first = next((r.error for r in results if not r.ok), "未知")
             ctx.notify("WARNING", f"视频下载器: 直链全部失败, 首个原因: {first}")
-
-    async def _handle_streams(
-        self, ctx: PluginContext, urls: list[str], subdir: str
-    ) -> None:
-        """m3u8/mpd: 交给 ffmpeg 拉流并转封装。"""
-        if not bool(ctx.config.get("hls_enabled", True)):
-            ctx.notify("WARNING", f"视频下载器: 跳过 {len(urls)} 个流式地址(已关闭 ffmpeg 处理)")
-            return
-
-        ffmpeg = _find_ffmpeg(str(ctx.config.get("ffmpeg_path") or ""))
-        if not ffmpeg:
-            ctx.notify(
-                "WARNING",
-                f"视频下载器: 发现 {len(urls)} 个 m3u8/mpd 流, 但找不到 ffmpeg, 已跳过",
-            )
-            return
-
-        timeout = int(ctx.config.get("ffmpeg_timeout_s") or 600)
-        for index, url in enumerate(urls):
-            # 流式地址的扩展名一律用 ffmpeg 的输出容器(.mp4), 不看 URL 后缀
-            target = ctx.download_path(subdir, f"stream_{index + 1}.mp4")
-            await self._run_ffmpeg(ctx, ffmpeg, url, target, timeout)
-
-    async def _run_ffmpeg(
-        self, ctx: PluginContext, ffmpeg: str, url: str, target: Path, timeout: int
-    ) -> None:
-        """执行一次 ffmpeg 拉流; 成功则登记产物, 失败则清理半成品。"""
-        record = DownloadedFile(url=url, plugin_id=self.id)
-
-        # ``-headers`` / ``-user_agent`` 是 **http 协议的私有选项**, 只有当输入是
-        # http(s) 时才存在。对本地文件(``file:`` 协议)加上它们会让 ffmpeg 直接报
-        # "Option headers not found" 而失败, 所以必须按协议区分。
-        input_opts: list[str] = []
-        if url.lower().startswith(("http://", "https://")):
-            # 流媒体站点普遍校验 Referer/UA, 不带就直接 403
-            input_opts += ["-headers", f"Referer: {ctx.url}\r\n"]
-            ua = str(ctx.settings.browser.user_agent or "").strip()
-            if ua:
-                input_opts += ["-user_agent", ua]
-
-        cmd = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            *input_opts,
-            "-i", url,
-            "-c", "copy",          # 不重编码, 只换容器
-            "-bsf:a", "aac_adtstoasc",  # HLS 的 ADTS AAC 转 mp4 需要
-            str(target),
-        ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                raise ValueError(f"ffmpeg 超时({timeout}s)") from None
-
-            if proc.returncode != 0:
-                detail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
-                raise ValueError(f"ffmpeg 退出码 {proc.returncode}: {detail[-1] if detail else '无输出'}")
-
-            if not target.exists() or target.stat().st_size == 0:
-                raise ValueError("ffmpeg 未产出文件(可能是加密流或需要鉴权)")
-
-            # 与直链下载同等把关: ffmpeg 退出码为 0 也可能是残片(拉流中断等)
-            problem = _verify_downloaded(target)
-            if problem is not None:
-                raise ValueError(f"完整性校验未通过: {problem}")
-
-            record.path = str(target)
-            record.filename = target.name
-            record.size = target.stat().st_size
-            record.mime_type = "video/mp4"
-            record.ok = True
-        except Exception as exc:  # noqa: BLE001 - 单个文件失败不影响其他
-            record.ok = False
-            record.error = f"{type(exc).__name__}: {exc}"
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
-        finally:
-            ctx.downloads.append(record)
-
-        if record.ok:
-            ctx.notify(
-                "INFO",
-                f"视频下载器: ffmpeg 合并完成 {record.filename} "
-                f"({round((record.size or 0) / 1024 / 1024, 1)} MB)",
-            )
-        else:
-            logger.warning(f"[video-downloader] ffmpeg 失败 {url}: {record.error}")
-            ctx.notify("WARNING", f"视频下载器: ffmpeg 处理失败 -> {record.error}")
 
 
 __all__ = ["VideoDownloaderPlugin"]
