@@ -61,12 +61,18 @@ _URLISH_PATH_RE = re.compile(
     re.I,
 )
 
-#: **明显不是媒体**的特征 —— 命中即降权/排除。
-#: 实测酷我整页唯一的 url 字段就是客户端安装包, 不排除掉会一直下 APK。
+#: **明显不是媒体**的特征 —— 命中即排除。
+#: 实测酷我整页唯一的 url 字段就是**客户端安装包**, 而且四种形态都出现过:
+#:   kwmusic_web_6.exe / kwplayer_ar_newpcguanwangmobile.apk /
+#:   kwplayercar_ar_APK_guanwang.apk / kwplayerautolite_C_APK_guanwang_lite.apk
+#: 第一版漏了 `.exe`(只列了 apk), 会把 Windows 客户端当候选去试探 —— 虽然试探阶段
+#: 也会因魔数不符被拒, 但没必要浪费请求。
 _NOT_MEDIA_RE = re.compile(
-    r"\.(?:apk|exe|dmg|pkg|msi|deb|rpm|zip|rar|7z|tar|gz|"
-    r"jpg|jpeg|png|gif|webp|bmp|svg|ico|css|js|json|xml|txt|html?|pdf|doc[xm]?|xls[xm]?|"
-    r"torrent|crx|xpi)(?:$|[?#])",
+    r"\.(?:apk|exe|msi|dmg|pkg|deb|rpm|appx|ipa|crx|xpi|"
+    r"zip|rar|7z|tar|gz|bz2|xz|cab|"
+    r"jpg|jpeg|png|gif|webp|bmp|svg|ico|tiff?|"
+    r"css|js|mjs|json|xml|txt|html?|pdf|doc[xm]?|xls[xm]?|ppt[xm]?|"
+    r"torrent|woff2?|ttf|eot|map)(?:$|[?#])",
     re.I,
 )
 #: 客户端/更新/统计/广告类关键词 —— 站点里这类地址很多, 且都长得像正常 URL
