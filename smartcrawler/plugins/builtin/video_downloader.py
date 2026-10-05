@@ -226,6 +226,10 @@ class VideoDownloaderPlugin(BasePlugin):
             max_file_size=int(ctx.config.get("max_file_size_mb") or 2048) * 1024 * 1024,
             concurrency=int(ctx.config.get("concurrency") or 2),
             allowed_types=("video/", "audio/", "application/octet-stream"),
+            # 不信 Content-Type, 交给落盘后的魔数校验。理由: `/clip.php?id=1` 这类地址
+            # 服务器会报 application/x-httpd-php, 而返回的其实是合法 mp4 —— 只看响应头
+            # 会把好文件拒掉。魔数校验本来就是更强的那道关(见 _verify_downloaded)。
+            verify_type_by_content=True,
         )
 
         # 落盘后把关: 框架按 HTTP 状态与字节数判定成功, 但被截断的容器**看起来

@@ -134,12 +134,21 @@ async def download_many(
     timeout: float = 30.0,
     allowed_types: Optional[tuple[str, ...]] = None,
     filename_prefix: str = "",
+    verify_type_by_content: bool = False,
 ) -> list[DownloadedFile]:
     """并发下载一批资源并登记产物。
 
     :param urls: ``[(绝对URL, 来源记录下标或 None), ...]``
     :param allowed_types: 只允许这些 Content-Type 前缀(如 ``("image/",)``); 为空则放行
+    :param verify_type_by_content: Content-Type 不符时**不直接拒绝**, 改为下载后用文件
+        魔数判定(调用方负责校验)。默认关闭。
     :returns: 下载结果列表(同时也写入了 ``ctx.downloads``)
+
+    ``verify_type_by_content`` 存在的理由: Content-Type 由服务端决定, 常常与真实内容不符 ——
+    典型是 ``/clip.php?id=1`` 这类地址(路径后缀不是媒体扩展名, 服务器就报
+    ``application/x-httpd-php``), 而返回的其实是合法的 mp4。只看响应头会把好文件拒之门外。
+    打开它以后, 类型判断交给**下载后的魔数校验**(``verify_media_file``), 那本来就是更强的
+    检查; 代价是不合规的文件会被真的下载下来再丢弃。
     """
     if not urls:
         return []
@@ -168,9 +177,15 @@ async def download_many(
                     if allowed_types and not any(
                         record.mime_type.lower().startswith(t) for t in allowed_types
                     ):
-                        record.ok = False
-                        record.error = f"类型不符: {record.mime_type or '未知'}"
-                        return
+                        if not verify_type_by_content:
+                            record.ok = False
+                            record.error = f"类型不符: {record.mime_type or '未知'}"
+                            return
+                        # 交给落盘后的魔数校验判定; 这里只记一笔便于排查
+                        logger.debug(
+                            f"[{plugin_id}] Content-Type {record.mime_type!r} 不在允许列表内, "
+                            "改为按文件魔数校验"
+                        )
 
                     ext = guess_extension(record.mime_type, url)
                     filename = f"{filename_prefix}{safe_filename_from_url(url, ext)}"

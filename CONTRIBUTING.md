@@ -15,6 +15,50 @@ python -m venv .venv
 
 依赖装不上时先看 [常见坑](#6-常见坑)。
 
+### 1.1 ffmpeg —— **可选, 但流式地址必须有**
+
+**不进仓库, 每个克隆的人要自己准备一次。** 它约 300 MB, 而且各平台二进制不同, 所以
+`.gitignore` 把 `tools/` 排除了。
+
+**什么时候需要它**: 下载地址是 **m3u8 / mpd 流**时。此时音频/视频不在单个文件里, 而是被切成
+一堆分片并由一个几 KB 的播放列表串起来 —— 必须用 ffmpeg 拉流并**转封装**(`-c copy`, 不重编码,
+所以快且无损)才能得到可播放的文件。没有 ffmpeg 时插件会**明确跳过并告警**, 不会把播放列表
+当媒体存下来。
+
+**什么时候不需要**: 直链(mp3 / m4a / mp4 / webm)由框架自己流式下载, 完全不碰 ffmpeg。
+网易云音乐给的就是直链, 所以**网易云下载器不需要 ffmpeg**。
+
+放置位置(插件按这个顺序找): 插件配置 `ffmpeg_path` → **项目内 `tools/ffmpeg/ffmpeg.exe`** → 系统 PATH。
+
+```bash
+# 推荐: 放进项目内, 不污染系统
+# 1) 下载 Windows 构建(约 190 MB, 含 libx264)
+#    https://github.com/BtbN/FFmpeg-Builds/releases  -> ffmpeg-master-latest-win64-gpl.zip
+# 2) 解压后把 bin/ffmpeg.exe 与 bin/ffprobe.exe 放到:
+#    tools/ffmpeg/ffmpeg.exe
+#    tools/ffmpeg/ffprobe.exe
+```
+
+> **要 GPL 构建, 不要 LGPL 构建。** 两者都能做转封装, 但 `scripts/selfcheck.py --e2e` 与
+> `scripts/verify_video_integrity.py` 需要**造**一个测试视频, 那要用 `libx264` —— 而 x264 是
+> GPL 授权的, LGPL 构建里没有, 会报 `Unknown encoder 'libx264'`。
+
+装好后确认:
+
+```bash
+.venv/Scripts/python.exe scripts/selfcheck.py --e2e    # [5] ffmpeg 与 [6] 端到端都应通过
+```
+
+### 1.2 pymusiclibrary —— 仅网易云下载器需要
+
+```bash
+.venv/Scripts/python.exe -m pip install pymusiclibrary
+```
+
+它用 QuickJS 执行 NeteaseCloudMusicApi 的 JS 逻辑, 因此**替我们完成了 weapi 加密**。
+网易云不把音频地址放在页面里(歌曲页没有 `<audio>`, 脚本里也没有可用地址), 必须经
+`/song/url/v1` 换取 —— 那需要加密请求体。没有这个库时"网易云音乐下载器"插件会跳过并提示安装。
+
 ## 2. 启用提交钩子(必做, 只需一次)
 
 仓库带了 `.githooks/pre-push`: 推送前扫描即将推送的内容里有没有密钥。

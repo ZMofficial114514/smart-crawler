@@ -224,6 +224,9 @@ class MusicDownloaderPlugin(BasePlugin):
             max_file_size=max_bytes,
             concurrency=int(ctx.config.get("concurrency") or 3),
             allowed_types=("audio/", "video/mp4", "application/ogg", "application/octet-stream"),
+            # 类型以落盘后的魔数为准: 服务端的 Content-Type 常与真实内容不符,
+            # 只看响应头会把合法音频拒掉(详见 _media.download_many 的说明)
+            verify_type_by_content=True,
         )
 
         ok = 0

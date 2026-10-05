@@ -18,8 +18,12 @@ fastapi>=0.111            # HTTP + WebSocket 应用框架
 uvicorn[standard]>=0.30   # ASGI 服务器(含 websockets / watchfiles)
 
 # ---------- 可选扩展(按需安装) ----------
+# pymusiclibrary>=0.0.4  # 「网易云音乐下载器」插件需要: 内置 weapi 加密以换取音频直链
 # sqlalchemy>=2.0        # 替代默认 sqlite3 的 ORM 存储
 # pymysql / pymongo      # MySQL / MongoDB 后端
 # redis                  # 分布式去重与队列
 # langchain              # 更复杂的 AI 编排
 # openai                 # 若想用官方 SDK 替代内置 httpx 客户端
+#
+# 另注: ffmpeg 不是 Python 依赖, 无法用 pip 安装。它只在"下载地址是 m3u8/mpd 流"时需要,
+# 放到 tools/ffmpeg/ffmpeg.exe 即可(该目录已 gitignore)。安装步骤见 CONTRIBUTING.md 1.1。

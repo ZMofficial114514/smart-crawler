@@ -38,11 +38,14 @@ STREAM_SUFFIXES = (".m3u8", ".mpd")
 MAGIC_EXT: dict[str, tuple[str, str]] = {
     "mp4": (".mp4", "video/mp4"),
     "m4a": (".m4a", "audio/mp4"),
+    "mp3": (".mp3", "audio/mpeg"),
     "matroska": (".webm", "video/webm"),
     "mpegts": (".ts", "video/mp2t"),
     "flv": (".flv", "video/x-flv"),
     "avi": (".avi", "video/x-msvideo"),
     "ogg": (".ogg", "audio/ogg"),
+    "flac": (".flac", "audio/flac"),
+    "wav": (".wav", "audio/wav"),
     "webp": (".webp", "image/webp"),
     "png": (".png", "image/png"),
     "jpeg": (".jpg", "image/jpeg"),
@@ -50,7 +53,9 @@ MAGIC_EXT: dict[str, tuple[str, str]] = {
 
 #: 允许"直接改名放行"的容器。**故意收窄**: 图片魔数出现在音频/视频插件里说明下载到的
 #: 根本不是媒体(常见于防盗链返回的占位图), 应当判失败而不是改名收下。
-PLAYABLE_KINDS: frozenset[str] = frozenset({"mp4", "m4a", "matroska", "mpegts", "flv", "ogg"})
+PLAYABLE_KINDS: frozenset[str] = frozenset(
+    {"mp4", "m4a", "mp3", "matroska", "mpegts", "flv", "ogg", "flac", "wav"}
+)
 
 #: 每个文件最多扫多少字节找 ``moov``(先头后尾, 足够覆盖绝大多数 mp4)
 MOOV_SCAN_BUDGET = 6 * 1024 * 1024
@@ -85,6 +90,43 @@ def is_stream_url(url: str) -> bool:
 # ---------------------------------------------------------------------------
 # 落盘后的把关
 # ---------------------------------------------------------------------------
+def _id3_payload_size(head: bytes) -> int:
+    """ID3v2 头里声明的标签体长度; 头不完整或非法时返回 0。
+
+    ID3v2 的头是 10 字节, 其中第 6..9 字节是 **syncsafe** 长度 —— 每个字节只用低 7 位
+    (最高位固定为 0), 因此 4 字节最多表示 2^28-1。按普通整数解析会把长度算错。
+    """
+    if len(head) < 10 or head[:3] != b"ID3":
+        return 0
+    size = 0
+    for b in head[6:10]:
+        if b & 0x80:
+            return 0
+        size = (size << 7) | b
+    return size
+
+
+def _mpeg_audio_frame_offset(head: bytes) -> int:
+    """在头部里找 MPEG 音频帧同步字(``0xFF Ex/Fx``); 找不到返回 -1。
+
+    为什么需要: **MP3 文件通常以 ID3v2 标签开头**, 所以第 0 字节不是帧同步字。
+    网易云给的音频正是这种(实测文件头 ``49 44 33 04 00 00 00 00`` = ``ID3\\x04``)。
+    只看前几字节会认不出来, 于是合法音频被当成"无法识别的文件类型"删掉。
+    """
+    start = 10 + _id3_payload_size(head) if head[:3] == b"ID3" else 0
+    for i in range(start, max(start, len(head) - 1)):
+        if head[i] == 0xFF and (head[i + 1] & 0xE0) == 0xE0:
+            # 排除保留值: MPEG1/2 Layer I/II/III 都符合, layer=00 不是有效帧
+            layer = (head[i + 1] >> 1) & 0x03
+            if layer != 0:
+                return i
+    return -1
+
+
+def _is_riff(head: bytes, kind: bytes) -> bool:
+    return head[:4] == b"RIFF" and head[8:12] == kind
+
+
 def sniff_kind(head: bytes) -> Optional[str]:
     """按文件魔数判断容器类型; 认不出返回 ``None``。
 
@@ -103,16 +145,24 @@ def sniff_kind(head: bytes) -> Optional[str]:
         return "mpegts"
     if head[:3] == b"FLV":
         return "flv"
-    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+    if _is_riff(head, b"AVI "):
         return "avi"
+    if _is_riff(head, b"WAVE"):
+        return "wav"
     if head[:4] == b"OggS":
         return "ogg"
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+    if head[:4] == b"fLaC":
+        return "flac"
+    if _is_riff(head, b"WEBP"):
         return "webp"
     if head[:8] == b"\x89PNG\r\n\x1a\n":
         return "png"
     if head[:3] == b"\xff\xd8\xff":
         return "jpeg"
+    # MP3 放最后: 它的判据最宽松(只是帧同步字), 让前面那些确定性更高的先匹配,
+    # 避免把别的格式误认成 mp3。
+    if _mpeg_audio_frame_offset(head) >= 0:
+        return "mp3"
     return None
 
 
@@ -161,9 +211,22 @@ def verify_media_file(
         return "文件为空"
 
     with path.open("rb") as fh:
-        head = fh.read(64)
+        # 读 4KB 而不是 64 字节: MP3 往往以 ID3v2 标签开头, 而标签里可能带整张封面图
+        # (几十到几百 KB), 帧同步字会落在前 64 字节之外。窗口太小会导致合法 mp3 被
+        # 判成"无法识别的文件类型"。
+        head = fh.read(4096)
 
     kind = sniff_kind(head)
+    if kind is None and head[:3] == b"ID3":
+        # MP3 的 ID3v2 标签可能带整张封面图(几十 KB 到几 MB), 帧同步字会落在首次读取的
+        # 4KB 之外。只有"看起来是 ID3 但没找到帧同步字"时才按标签声明的长度补读一次 ——
+        # 避免对每个文件都多读一遍。
+        want = 10 + _id3_payload_size(head) + 8192
+        if want > len(head):
+            with path.open("rb") as fh:
+                head = fh.read(min(want, 4 * 1024 * 1024))
+            kind = sniff_kind(head)
+
     if kind is None:
         return f"无法识别的文件类型(文件头 {head[:8].hex(' ')})"
 
