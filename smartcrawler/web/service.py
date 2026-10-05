@@ -907,7 +907,21 @@ class CrawlService:
 
         if result.success:
             message = f"抓取完成, 共 {result.item_count} 条 / {result.pages_crawled} 页"
-            status = "success"
+            # 抓取成功但插件下载有缺口时如实附上, 而不是把状态判成 failed。
+            #
+            # **这是 issue #5 的另一半**: 原先只要有错误就落到下面的 else 分支, 于是
+            # "30 条数据一条不少、只差 1 首没下好"也被报成"部分完成…存在错误",
+            # 看起来像插件坏了。抓取与下载是两件事, 状态要分开表达。
+            failed_dl = [d for d in result.downloads if not d.ok]
+            if failed_dl:
+                status = "success"
+                message += f"(有 {len(failed_dl)} 个文件未下载成功)"
+                if result.download_errors:
+                    for err in result.download_errors:
+                        if err not in task.warnings:
+                            task.warnings.append(err)
+            else:
+                status = "success"
         elif result.errors and any("robots" in e for e in result.errors):
             status, message = "failed", "被 robots.txt 拒绝(合规优先), 任务终止"
         elif not items:

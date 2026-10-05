@@ -1189,7 +1189,24 @@ class SmartCrawler:
 
         result.duration_ms = round((time.perf_counter() - started) * 1000, 1)
         result.finished_at = result.finished_at or datetime.now().isoformat(timespec="seconds")
-        result.success = bool(result.items) and not result.errors
+
+        # 把"抓取本身失败"与"插件下载部分失败"分开。
+        #
+        # **为什么必须分**(对应 issue #5): 下载是**附属步骤**, 不该决定抓取任务的成败。
+        # 实测网易云 10 首里有 1 首 CDN 读超时, 原先让整个任务变成 failed, 界面提示
+        # "部分完成: 10 条, 但存在错误" —— 用户以为插件坏了, 而实际上数据一条不少、9 首也
+        # 已经下好。把下载失败算进 `success` 会掩盖"抓取确实成功"这个事实。
+        _DL_HINT = ("下载", "插件", "download")
+        download_errors = [e for e in result.errors if any(k in e for k in _DL_HINT)]
+        core_errors = [e for e in result.errors if e not in download_errors]
+        result.download_errors = download_errors
+        result.success = bool(result.items) and not core_errors
+        if download_errors and result.success and result.downloads:
+            failed = [d for d in result.downloads if not d.ok]
+            if failed:
+                logger.warning(
+                    f"抓取成功, 但有 {len(failed)}/{len(result.downloads)} 个文件未下载成功"
+                )
         logger.info(
             f"任务 {result.task_id} 结束: success={result.success} "
             f"items={result.item_count} pages={result.pages_crawled} "

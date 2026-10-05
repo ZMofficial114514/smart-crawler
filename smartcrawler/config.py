@@ -103,7 +103,11 @@ class AIConfig(BaseModel):
     model: str = "gpt-4o-mini"
     api_key: str = ""  # 从环境变量读取, 不要硬编码
     temperature: float = 0.1
-    max_tokens: int = 2048
+    #: 单次回复的 token 上限。**推理模型要留足余量**: 它们的思考内容同样计入这个上限,
+    #: 2048 在稍复杂的页面上会被思考过程吃光, 表现为 content="" + finish_reason=length,
+    #: 上层看到的是"AI 未能生成规则, 降级到规则引擎"。实测某音乐搜索页每次都会撞上。
+    #: 另外 `AIEngine.chat()` 在撞到 length 时会自动升档重试, 这里给一个够用的起点。
+    max_tokens: int = 8192
     timeout: float = 60.0  # 单次 AI 调用超时(秒)
     max_retries: int = 2
     cache_enabled: bool = True  # 缓存 AI 响应, 相同输入不重复计费

@@ -142,7 +142,18 @@ class AIClient:
         logger.debug(f"AI 调用: {cfg.provider} {cfg.model} @ {truncate(base, 60)}")
         async with httpx.AsyncClient(timeout=cfg.timeout) as client:
             last_error = ""
-            for attempt in range(cfg.max_retries + 1):
+            #: 因 max_tokens 被推理过程耗尽而重试的次数与预算上限。
+            #:
+            #: **为什么必须自动加大**: 推理模型(如 deepseek 的 flash/reasoner 系)会先输出
+            #: 一段思考内容, 那部分**同样计入 max_tokens**。默认 2048 在稍复杂的页面上会被
+            #: 思考过程吃光, 于是 content="" + finish_reason=length —— 框架只打了个告警就
+            #: 返回空, 上层表现为"AI 未能生成规则, 降级到规则引擎"。实测该站点的页面正是
+            #: 每次都撞这条(日志里连续多次 "max_tokens (2048) 被推理过程耗尽")。
+            #: 自动升档比让用户自己去猜该填多大靠谱得多。
+            length_retries = 0
+            max_length_retries = 2
+            attempt = 0
+            while attempt <= cfg.max_retries:
                 try:
                     resp = await client.post(url, json=payload, headers=headers)
                     # 部分服务不支持 response_format, 自动降级重试一次
@@ -161,9 +172,19 @@ class AIClient:
                         self._save_cache()
                     finish = data["choices"][0].get("finish_reason")
                     if not content and finish == "length":
+                        # 升档重试: 预算翻倍, 最多两次。
+                        if length_retries < max_length_retries and budget < 65536:
+                            length_retries += 1
+                            budget = min(budget * 4, 65536)
+                            payload["max_tokens"] = budget
+                            logger.warning(
+                                f"AI 回复为空且 finish_reason=length: max_tokens 被推理过程耗尽, "
+                                f"自动升档到 {budget} 重试(第 {length_retries} 次)"
+                            )
+                            continue
                         logger.warning(
-                            "AI 回复为空且 finish_reason=length: max_tokens "
-                            f"({budget}) 被推理过程耗尽, 请调大预算或改用非推理模型"
+                            f"AI 回复为空且 finish_reason=length: max_tokens ({budget}) "
+                            "被推理过程耗尽, 请调大预算或改用非推理模型"
                         )
                     logger.debug(f"AI 调用成功, 返回 {len(content)} 字符")
                     return content
@@ -178,6 +199,7 @@ class AIClient:
                     wait = 2.0**attempt
                     logger.warning(f"AI 调用失败({last_error}), {wait:.0f}s 后重试")
                     await asyncio.sleep(wait)
+                attempt += 1
             logger.error(f"AI 调用最终失败: {last_error}")
             return None
 

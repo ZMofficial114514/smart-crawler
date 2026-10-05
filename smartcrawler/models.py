@@ -364,3 +364,12 @@ class TaskResult(BaseModel):
         default_factory=list, description="插件下载的文件(图片/音频等)"
     )
     plugin_errors: list[str] = Field(default_factory=list, description="插件执行失败信息")
+    #: 只能算"警告"的错误 —— 目前是插件下载的失败。
+    #:
+    #: **为什么要和 `errors` 分开**: 下载是抓取的附属步骤, 不该决定任务成败。实测网易云
+    #: 10 首里 1 首 CDN 读超时, 若把它算进 `success` 会让整个任务显示失败, 用户以为插件
+    #: 坏了 —— 而数据一条不少、9 首也下好了(对应 issue #5)。
+    download_errors: list[str] = Field(
+        default_factory=list,
+        description="插件下载的失败信息(不影响抓取是否成功, 界面应按警告呈现)",
+    )

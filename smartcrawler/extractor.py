@@ -50,6 +50,24 @@ _EXTRACT_DOM_JS = r"""
                 el = nodes[0] || null;
             } else {
                 el = item.querySelector(f.selector);
+                // 精确选择器没命中时, 逐级**缩短**再试。
+                //
+                // **为什么必须这么做**: 列表项之间的 DOM 未必完全一致。实测网易云音乐的
+                // 搜索结果里"专辑"一列有**两种写法**:
+                //   11 行: <a class="s-fc3" href="/album?id=3109627"><span class="s-fc7">《热门华语262》</span></a>
+                //   19 行: <a class="s-fc3" href="/album?id=3186819" title="《いしころ》">《いしころ》</a>
+                // 采样器在第一行看到内层 span, 生成的规则就带上了它 —— 那 19 行没有这个 span,
+                // 于是专辑列只有 11/30 行有值。
+                //
+                // 缩短成 `a.s-fc3` 后两种写法都能选中同一个链接、文本也一致, 所以这个兜底既能
+                // 救回数据又不会取到别的东西。**只在本行精确失配时才走**, 不影响正常页面。
+                if (!el && f.selector.indexOf(' ') > 0) {
+                    const parts = f.selector.split(/\s+/).filter(Boolean);
+                    for (let n = parts.length - 1; n >= 1 && !el; n--) {
+                        try { el = item.querySelector(parts.slice(0, n).join(' ')); }
+                        catch (e) { /* 非法选择器, 继续缩短 */ }
+                    }
+                }
             }
         } catch (e) { return null; }
         if (!el) return null;

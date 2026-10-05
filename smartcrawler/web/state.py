@@ -64,6 +64,11 @@ class TaskState:
     progress: float = 0.0
     message: str = ""
     errors: list[str] = field(default_factory=list)
+    #: 非致命提示: 任务**成功**但存在缺口(目前是"部分文件未下载成功")。
+    #:
+    #: 与 `errors` 分开的意义: `errors` 会把任务渲染成失败, 而"30 条数据都在、只差 1 首
+    #: 没下好"不该呈现为失败(对应 issue #5)。界面应把 warnings 显示为黄色提示而非红色错误。
+    warnings: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -118,6 +123,7 @@ class TaskState:
             "progress": self.progress,
             "message": self.message,
             "errors": self.errors,
+            "warnings": self.warnings,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,

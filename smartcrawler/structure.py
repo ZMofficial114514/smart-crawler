@@ -160,24 +160,39 @@ _ANALYZE_JS = r"""
     };
     const relSelector = (scope, el) => {
         if (!scope || !el || el === scope) return null;
-        const path = [];  // 从 el 向上到 scope 直接子节点之间的路径(不含顶层)
+
+        // 从 el 往上收集路径(不含 scope 本身), 上限放宽到 12 层。
+        const path = [];
         let cur = el;
         for (let i = 0; i < 12 && cur && cur !== scope; i++) {
-            if (cur.parentElement === scope) {
-                const parts = [tagClass(cur)];
-                for (let j = Math.min(path.length, 2) - 1; j >= 0; j--) parts.push(tagClass(path[j]));
-                return parts.join(' ');
-            }
             path.push(cur);
+            if (cur.parentElement === scope) break;
             cur = cur.parentElement;
         }
-        // 超出层级预算: 退化为"最近祖先 + 目标" —— 保证字段不丢。
-        // 注意要保持后代关系(空格), 不能用 ' > ', 否则会要求直接的父子关系而匹配不到。
-        if (path.length >= 2) {
-            return tagClass(path[path.length - 1]) + ' ' + tagClass(el);
+
+        // **从最短的开始试, 返回第一个唯一的选择器。**
+        //
+        // 这是本函数的关键行为, 直接决定字段抓不抓得到。实测网易云音乐搜索结果的
+        // "专辑"一列在**同一个页面里有两种 DOM 写法**:
+        //     11 行: <a class="s-fc3" href="/album?id=3109627"><span class="s-fc7">《热门华语262》</span></a>
+        //     19 行: <a class="s-fc3" href="/album?id=3186819" title="《いしころ》">《いしころ》</a>
+        // 老实现无条件把"目标 + 上两级"拼成 `div.td.w2 a.s-fc3 span.s-fc7` —— 那 19 行没有
+        // 内层 span, 选择器直接失配, 于是专辑列**只有 11/30 行有值**, 用户看到的正是这一点。
+        //
+        // 从短到长试即可自然规避: 先试 `a.s-fc3`(两种写法都能选中该链接), 它已唯一, 直接返回,
+        // 不会退化成带 span 的深路径。这条规则同时让选择器对站点的小改版更耐受 ——
+        // 层级越浅, 越不容易因为中间多包一层 div 而失效。
+        for (let depth = 0; depth < path.length; depth++) {
+            const cand = path.slice(0, depth + 1).map(tagClass).reverse().join(' ');
+            if (!cand) continue;
+            try {
+                if (scope.querySelectorAll(cand).length === 1) return cand;
+            } catch (e) { /* 非法选择器, 试下一个 */ }
         }
-        if (path.length === 1) {
-            return tagClass(el);
+
+        // 没有唯一的: 用最长的路径(信息最多), 让调用方按"命中多个"处理
+        if (path.length) {
+            return path.map(tagClass).reverse().join(' ');
         }
         return tagClass(el);
     };
@@ -268,6 +283,36 @@ _ANALYZE_JS = r"""
         // 语义字段可能确实抓不到内容(站点把该列留空), 那也不该因此让用户失去这一列 ——
         // 这里只在"冗余"时丢弃, 不做"空值"判断(空值判断在提取阶段才有意义)。
         return keep;
+    };
+
+    // ---- 把"光杆包装元素"提升到更稳的祖先 ----
+    //
+    // 什么算光杆包装: 元素自身**没有稳定 class**, 且是父元素的**唯一子元素**, 文本也一样。
+    // 这种元素通常是站点为了样式或条件渲染临时加的, 未必每行都有。
+    //
+    // **实测代价**(网易云音乐搜索结果的专辑列, 同一个页面两种写法):
+    //     11 行: <a class="s-fc3" href="/album?id=3109627"><span class="s-fc7">《热门华语262》</span></a>
+    //     19 行: <a class="s-fc3" href="/album?id=3186819" title="《いしころ》">《いしころ》</a>
+    // 采样器第一眼看到第 1 行, 就把那个 span 当成目标, 生成
+    // `div.td.w2 a.s-fc3 span.s-fc7` —— 而 19 行里根本没有这个 span, 于是专辑列**只有
+    // 11/30 行有值**。提升到父元素 `a.s-fc3` 后, 两种写法都能选中, 而且取到的文本一致。
+    const unwrapTarget = (el, sample) => {
+        let cur = el;
+        for (let depth = 0; depth < 3; depth++) {
+            const parent = cur.parentElement;
+            if (!parent || parent === sample) break;
+            // 父元素必须只有这一个子元素, 且自身可定位(class/id/title)
+            if (parent.childElementCount !== 1) break;
+            const parentLocatable = stableClasses(parent).length > 0 ||
+                                    !!parent.id || parent.hasAttribute('title');
+            if (!parentLocatable) break;
+            // 文本必须一致 —— 否则父元素还包含别的内容, 换了会改变取值
+            const tCur = ((cur.textContent || '')).trim();
+            const tPar = ((parent.textContent || '')).trim();
+            if (tCur && tPar && tCur !== tPar) break;
+            cur = parent;
+        }
+        return cur;
     };
 
     // ---- 从样本列表项推断字段 ----
@@ -376,11 +421,15 @@ _ANALYZE_JS = r"""
             if (fields.length >= MAX_FIELDS || el.childElementCount !== 0) return;
             const t = ((el.innerText || '')).trim();
             if (!t || t.length < 2 || t.length > 60) return;
-            const cls = stableClasses(el);
-            const tag = el.tagName.toLowerCase();
+            // 光杆包装元素(如裸 <span>)提升到更稳的祖先: 它们在部分行里可能不存在,
+            // 而父元素在、文本还一样。详见 unwrapTarget 的说明。
+            const target = unwrapTarget(el, sample);
+            const cls = stableClasses(target);
+            const tag = target.tagName.toLowerCase();
+            const tt = ((target.innerText || '')).trim() || t;
             // 无 class 的裸标签给中性名(后续归一化: text -> title)
             const base = cls.length ? cls[0] : (tag === 'a' ? 'text' : tag);
-            push(semanticName(el, t, base), relSelector(sample, el), null);
+            push(semanticName(target, tt, base), relSelector(sample, target), null);
         });
         return dropRedundantFields(sample, fields);
     };

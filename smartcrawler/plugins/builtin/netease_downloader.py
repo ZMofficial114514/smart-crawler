@@ -156,6 +156,32 @@ def _quiet_library():
             os.close(devnull)
 
 
+#: 判定"瞬时失败"的错误特征 —— 这类失败重试一次往往就好了。
+#: 对应 issue #5: 网易云 CDN 偶发 ReadTimeout, 没有重试会让整个任务看起来像坏了。
+_TRANSIENT_RE = re.compile(
+    r"timeout|timed out|超时|connect|connection|reset|refused|unreachable|"
+    r"Temporary failure|502|503|504|429|too many requests",
+    re.I,
+)
+
+
+def _is_transient_error(error: Any) -> bool:
+    """错误是否属于"值得重试"的瞬时问题。
+
+    **不重试**的情况: HTTP 403/404(地址失效或防盗链)、类型不符、完整性校验未通过 ——
+    这些再试多少次结果都一样, 重试只会浪费时间并加重对方限流。
+    """
+    text = str(error or "")
+    if not text:
+        return False
+    # 永久性错误优先排除
+    if re.search(r"\b(?:40[0-9])\b", text) and not re.search(r"\b429\b", text):
+        return False
+    if "类型不符" in text or "完整性校验" in text or "超过大小上限" in text:
+        return False
+    return bool(_TRANSIENT_RE.search(text))
+
+
 def _safe_name(text: str, limit: int = 80) -> str:
     """把歌名/歌手变成安全的文件名片段。"""
     text = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (text or "").strip())
@@ -408,6 +434,31 @@ class NeteaseMusicPlugin(BasePlugin):
             # 类型判定交给落盘后的魔数校验(它认 mp3/m4a/flac 等)。
             verify_type_by_content=True,
         )
+
+        # 失败的单曲重试一轮。
+        #
+        # **为什么需要**(对应 issue #5): 网易云 CDN 偶发读超时, 实测 10 首里会有 1 首
+        # `ReadTimeout`。原先没有重试, 一首失败就让整个任务带上错误、状态变 failed, 用户看到
+        # "插件坏了" —— 而实际上再试一次就成功。音频文件大、并发又低, 一次重试的成本远低于
+        # 让用户以为功能失效。
+        retryable = [r for r in results if not r.ok and _is_transient_error(r.error)]
+        if retryable:
+            logger.info(f"网易云下载器: {len(retryable)} 首疑似瞬时失败, 重试一轮")
+            pairs = [(r.url, getattr(r, "source_item_index", None)) for r in retryable]
+            retried = await download_many(
+                ctx, pairs, plugin_id=self.id, subdir=subdir,
+                referer="https://music.163.com/", max_file_size=max_bytes,
+                concurrency=1,  # 重试时降并发, 避免再被限流/超时
+                allowed_types=("audio/", "video/mp4", "application/ogg",
+                               "application/octet-stream", "binary/octet-stream"),
+                verify_type_by_content=True,
+            )
+            # 用重试结果替换原记录(同 URL 的成败状态以最后一次为准)
+            by_url = {r.url: r for r in retried}
+            for i, r in enumerate(results):
+                if r.url in by_url:
+                    results[i] = by_url[r.url]
+
         for record in results:
             if not record.ok or not record.path:
                 continue
