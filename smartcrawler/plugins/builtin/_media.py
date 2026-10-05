@@ -89,6 +89,22 @@ def guess_extension(content_type: str, url: str, default: str = ".bin") -> str:
     return default
 
 
+def _human_size(num_bytes: int) -> str:
+    """把字节数格式化成人类可读(如 ``43.8KB`` / ``512.0MB``)。
+
+    直接整除成 MB 会把小于 1MB 的值全部显示成 ``0MB``, 让小文件的大小上限
+    报错变得毫无信息量 —— 这里按量级选单位。
+    """
+    size = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)}B"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
 def absolute_url(base: str, candidate: str) -> str:
     """把可能是相对路径的资源地址补全为绝对 URL。"""
     candidate = (candidate or "").strip()
@@ -162,17 +178,36 @@ async def download_many(
                         filename += ext
                     target = ctx.download_path(subdir, filename)
 
-                    size = 0
-                    with target.open("wb") as handle:
-                        async for chunk in response.aiter_bytes(64 * 1024):
-                            size += len(chunk)
-                            if size > max_file_size:
-                                raise ValueError(f"超过大小上限 {max_file_size // 1024 // 1024}MB")
-                            handle.write(chunk)
-
+                    # 必须在开始写入**之前**登记路径: 下面的半成品清理依赖
+                    # ``record.path``。若等到写盘成功后再赋值, 中途抛异常(撞大小
+                    # 上限、连接中断)时清理逻辑会因 path 为空而跳过, 于是在磁盘上
+                    # 留下一个体积巨大、结构不完整却"看起来下载过"的残片。
                     record.path = str(target)
                     record.relative_path = _relative(target)
                     record.filename = target.name
+
+                    # 若服务端声明了 Content-Length 且已超限, 直接放弃, 连一个
+                    # 字节都不写 —— 省掉无谓的下载与磁盘写入。
+                    declared = response.headers.get("Content-Length")
+                    if declared and declared.isdigit() and int(declared) > max_file_size:
+                        raise ValueError(
+                            f"文件 {_human_size(int(declared))} 超过大小上限 "
+                            f"{_human_size(max_file_size)}(未开始下载)"
+                        )
+
+                    size = 0
+                    with target.open("wb") as handle:
+                        async for chunk in response.aiter_bytes(64 * 1024):
+                            # 先判断再写: 否则会多写入一个 chunk, 且落盘尺寸与上限
+                            # 不一致(旧实现会写出恰好等于上限+chunk 的残片)。
+                            if size + len(chunk) > max_file_size:
+                                raise ValueError(
+                                    f"超过大小上限 {_human_size(max_file_size)}"
+                                    f"(已写入 {_human_size(size)}, 已丢弃半成品)"
+                                )
+                            handle.write(chunk)
+                            size += len(chunk)
+
                     record.size = size
                     record.ok = True
             except Exception as exc:  # noqa: BLE001 - 单个文件失败不影响其他下载

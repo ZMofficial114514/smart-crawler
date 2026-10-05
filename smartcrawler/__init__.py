@@ -33,7 +33,7 @@ from typing import Any
 #: **唯一的版本号来源**。其它地方(Web 接口、健康检查、User-Agent)一律从这里读,
 #: 避免出现"包说 0.1.0、健康检查说 0.2.0"这种自相矛盾的情况 —— 这真的发生过。
 #: 改动版本时只改这一行, 见 CHANGELOG.md。
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "SmartCrawler",
     "Settings",

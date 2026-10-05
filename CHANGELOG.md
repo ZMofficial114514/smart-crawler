@@ -17,6 +17,13 @@
 
 > 各版本要点。技术细节见下方条目。
 
+### v1.2.0
+
+- 修复下载撞大小上限时留下半成品: 路径改为写盘前登记, 异常清理才真正生效;
+  新增 `Content-Length` 预检, 并把报错里的尺寸换成人类可读单位。
+- 新增视频下载器: mp4/webm 直链走框架下载, m3u8/mpd 交给 ffmpeg 转封装;
+  落盘后按文件魔数纠正扩展名并校验 MP4 的 `moov` 索引, 不完整即删除并标记失败。
+
 ### v1.1.0
 
 - 支持「外壳 + 内嵌 iframe」站点: 自动下探到内容所在的同源 frame 并在该 frame 上提取
@@ -58,6 +65,73 @@
 - 多实例清理范围限定为自身进程链 (原会终止其他实例的浏览器)。
 - 浏览器失效时自动重建并重试。
 - 新增推送前密钥检查。
+
+## [1.2.0] — 2026-10-05
+
+新增视频下载器(m3u8/mpd 交给 ffmpeg 合并), 并修掉"半成品文件残留"这个会造成假成功的问题。
+
+### 1. 下载撞大小上限时留下半成品(真实事故)
+
+`smartcrawler/plugins/builtin/_media.py` 的 `download_many` 有个顺序错误:
+异常路径的清理依赖 `record.path`, 而 `record.path` 是在**写盘成功之后**才赋值的。
+于是流式写入中途撞上 `max_file_size` 抛异常时, 清理分支看到 `path` 为空直接跳过,
+磁盘上就留下一个体积巨大、结构不完整、却"看起来下载过"的残片。
+
+真实事故: 512 MiB 的 mp4 残片, 大小恰好等于当时的 `max_file_size_mb: 512`,
+`ffprobe` 报 `moov atom not found` —— 播不了, 但记录里是成功。
+
+三处改动:
+
+- 写入**前**登记 `record.path` / `record.relative_path` / `record.filename`,
+  让异常路径的清理真正生效;
+- 新增 `Content-Length` 预检: 服务端已声明超限时连一个字节都不写; 大小判断由
+  "先写后判"改为"先判断再写", 不再写出"上限 + 1 个 chunk"的残片;
+- 新增 `_human_size()`: 原实现把字节整除成 MB, 1 MiB 以下一律显示 `0MB`,
+  让"到底差多少"完全看不出来。
+
+### 2. 新增视频下载器(新增能力)
+
+`smartcrawler/plugins/builtin/video_downloader.py`。框架原有的下载器只会
+"流式 GET 然后写盘", 遇到 m3u8 会把播放列表(几 KB 文本)当成功结果存下来 ——
+文件名看着像视频, 内容是文本, 属于静默的错误结果。现按来源分流:
+
+- **mp4 / webm 直链** —— 复用 `download_many`(带 Referer 防盗链);
+- **m3u8 / mpd 流** —— 交给 ffmpeg `-c copy` 转封装, 不重编码; 找不到 ffmpeg
+  就明确跳过并告警, 绝不产出假文件。
+
+落盘后的两重把关:
+
+- **扩展名按文件魔数判定**, 不按 URL 后缀 —— 否则 `/clip.php?id=1` 这类地址会把
+  视频存成 `.php`, 此后没人认得出来;
+- **校验 MP4 的 `moov` 索引原子** —— 被截断的 mp4 文件头依然是合法的 `ftyp`,
+  只看前几字节会误判成功; 不通过校验的文件会被删除并标记失败。
+
+`-headers` / `-user_agent` 是 http 协议的私有选项, 因此按协议区分注入, 对本地
+`file:` 输入不加(否则 ffmpeg 直接报 `Option headers not found`)。插件默认关闭,
+单文件上限默认 2048 MB —— 这是截断点而不是护栏, 设太小会把长视频切成残片。
+
+### 3. 文档
+
+- 新增 `CONTRIBUTING.md`, 并补上"必须手动执行 `git config core.hooksPath .githooks`"
+  这一步: Git 不会自动启用克隆下来的钩子, 不执行的话密钥扫描这道防线是关着的;
+- 说明新克隆的仓库里没有 `data/session.json`(会话等同于凭据, 已在 `.gitignore`),
+  抓取需要登录的站点前要自行登录一次;
+- 移除 `docs/plugins.md` 里一段围栏损坏的残留代码块(它把第 2 节整节吞进了代码块,
+  并示范了错误的 `on_page` 签名)。
+
+### 验收
+
+- 新增 `scripts/verify_media_truncation.py`: 本地靶站 + **不声明** Content-Length 的
+  流式响应, 覆盖"不留残片 / 预检不建文件 / 未超限正常落盘 / 尺寸格式化"。
+  刻意避开 Content-Length 是为了让"写了一半"的路径可测 ——
+  修复前 4 项失败, 修复后 15/15 通过。
+- 新增 `scripts/verify_video_integrity.py`(5 个场景, 含"截断的 mp4 必须被拦下")与
+  `scripts/selfcheck.py`(环境/依赖/插件/浏览器/ffmpeg 自检, `--e2e` 真造一个 HLS
+  流让插件合并一遍), 两者都离线可跑。
+- 回归: `check_version` 通过(1.2.0)、`check_changelog` 106/106、
+  `check_plugin_docs` 111/111、`check_no_secrets` 通过、
+  `verify_media_truncation` 15/15、`verify_video_integrity` 全部通过、
+  `selfcheck --e2e` 通过; 插件管理器可正常加载内置插件(含新增的 video-downloader)。
 
 ## [1.1.0] — 2026-10-04
 
