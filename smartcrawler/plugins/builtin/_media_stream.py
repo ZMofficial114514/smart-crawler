@@ -38,6 +38,8 @@ STREAM_SUFFIXES = (".m3u8", ".mpd")
 MAGIC_EXT: dict[str, tuple[str, str]] = {
     "mp4": (".mp4", "video/mp4"),
     "m4a": (".m4a", "audio/mp4"),
+    # 绝大多数真实 mp3 以 ID3v2 标签开头; 无标签的裸帧也要认(见 sniff_kind)
+    "mp3": (".mp3", "audio/mpeg"),
     "matroska": (".webm", "video/webm"),
     "mpegts": (".ts", "video/mp2t"),
     "flv": (".flv", "video/x-flv"),
@@ -50,7 +52,9 @@ MAGIC_EXT: dict[str, tuple[str, str]] = {
 
 #: 允许"直接改名放行"的容器。**故意收窄**: 图片魔数出现在音频/视频插件里说明下载到的
 #: 根本不是媒体(常见于防盗链返回的占位图), 应当判失败而不是改名收下。
-PLAYABLE_KINDS: frozenset[str] = frozenset({"mp4", "m4a", "matroska", "mpegts", "flv", "ogg"})
+PLAYABLE_KINDS: frozenset[str] = frozenset(
+    {"mp4", "m4a", "mp3", "matroska", "mpegts", "flv", "ogg"}
+)
 
 #: 每个文件最多扫多少字节找 ``moov``(先头后尾, 足够覆盖绝大多数 mp4)
 MOOV_SCAN_BUDGET = 6 * 1024 * 1024
@@ -89,7 +93,17 @@ def sniff_kind(head: bytes) -> Optional[str]:
     """按文件魔数判断容器类型; 认不出返回 ``None``。
 
     顺序有讲究: ``ftyp`` 出现在偏移 4(前面是 box size), 必须先于通用判断。
+
+    mp3 有两种开头, 必须都认 —— 漏掉 ID3 那条会把**绝大多数真实 mp3** 判成
+    "无法识别", 于是完整性校验把已经下好的文件删掉(音乐站点直链下载的典型形态
+    就是带 ID3 标签的 mp3)。
     """
+    # ID3v2 标签: 'ID3' + 版本 + 标志 + 同步安全长度。真实发行的 mp3 基本都带。
+    if head[:3] == b"ID3":
+        return "mp3"
+    # 裸 MPEG 音频帧同步字: 11 个 1(0xFF 后高 3 位全 1)后跟层/版本位
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "mp3"
     if len(head) < 12:
         return None
     if head[4:8] == b"ftyp":
@@ -196,6 +210,10 @@ def verify_media_file(
 
 def _ext_matches_kind(ext: str, kind: str) -> bool:
     """扩展名与容器是否自洽(允许 .m4a 承载 mp4 容器这类合理换名)。"""
+    if kind == "mp3":
+        # 裸 MPEG 音频流常挂在 .bin / .php / 无扩展名 的地址上, 内容本身就是 mp3,
+        # 这类应当改名放行 —— 与"MKV 却叫 .m4a"那种表里不一是两回事。
+        return True
     known = {e for e, _m in MAGIC_EXT.values()} | {".mka", ".m4a"}
     if ext not in known:
         return False
