@@ -145,7 +145,98 @@ class MusicDownloaderPlugin(BasePlugin):
             "min": 30,
             "max": 7200,
         },
+        {
+            "key": "sniff_network",
+            "label": "从接口响应里嗅探下载地址",
+            "type": "bool",
+            "default": True,
+            "description": (
+                "**很多音乐站不把地址放在页面里** —— 页面没有 audio 元素、脚本里也没有可用"
+                "地址, 只在某个接口的 JSON 里出现。打开后会在已捕获的网络响应里翻找疑似"
+                "媒体地址, 并**逐个试探验证**(按实际返回的魔数判断), 只下载验证通过的。"
+                "排除客户端安装包/图片/统计等噪声地址。"
+            ),
+        },
+        {
+            "key": "sniff_fields",
+            "label": "嗅探关注字段",
+            "type": "str",
+            "default": "",
+            "description": (
+                "只在这些 JSON 字段名里找地址, 逗号分隔。留空 = 自动(按 url/song/album/"
+                "author/name/play/download 等提示词加权, 并对 pic/lyric/comment 等降权)。"
+                "例: url,playUrl,audioUrl,downloadUrl"
+            ),
+        },
+        {
+            "key": "sniff_max_probe",
+            "label": "最多试探几个地址",
+            "type": "int",
+            "default": 12,
+            "min": 1,
+            "max": 100,
+            "description": "接口噪声多时全试一遍既慢又像攻击, 默认只试分数最高的前 12 个",
+        },
     ]
+
+    async def _sniff_audio_urls(self, ctx: PluginContext, limit: int) -> list[str]:
+        """从已捕获的接口响应里翻出并**验证**可用的音频地址。
+
+        返回验证通过的地址列表(已去重、已按 limit 截断)。任何异常都吞掉 —— 嗅探是
+        "锦上添花"的路径, 不能因为它失败而让本来能跑的页面提取挂掉。
+        """
+        crawler = getattr(ctx, "crawler", None)
+        recorder = getattr(crawler, "recorder", None)
+        records = list(getattr(recorder, "records", None) or [])
+        if not records:
+            ctx.notify("DEBUG", "音乐下载器: 没有网络记录可供嗅探(需先抓取页面)")
+            return []
+
+        fields = [s.strip() for s in str(ctx.config.get("sniff_fields") or "").split(",")
+                  if s.strip()]
+        try:
+            import httpx  # noqa: PLC0415
+
+            from ._media_sniff import find_candidates, probe_url  # noqa: PLC0415
+
+            found = find_candidates(records, max_candidates=max(limit * 6, 24))
+            # 用户点了名就只在这些字段里找
+            if fields:
+                lowered = [f.lower() for f in fields]
+                found = [c for c in found
+                         if any(f in (c.field or "").lower() for f in lowered)]
+            if not found:
+                ctx.notify("DEBUG", "音乐下载器: 接口响应里没有发现疑似音频地址")
+                return []
+
+            max_probe = int(ctx.config.get("sniff_max_probe") or 12)
+            ctx.notify("INFO", f"音乐下载器: 接口里找到 {len(found)} 个疑似地址, "
+                               f"开始试探前 {min(len(found), max_probe)} 个")
+            verified: list[str] = []
+            rejected = 0
+            async with httpx.AsyncClient(follow_redirects=True,
+                                         headers={"User-Agent": ctx.settings.browser.user_agent
+                                                  or "Mozilla/5.0"}) as client:
+                for cand in found[:max_probe]:
+                    if len(verified) >= limit:
+                        break
+                    ok, why = await probe_url(client, cand.url, referer=ctx.url)
+                    if ok:
+                        verified.append(cand.url)
+                        ctx.notify("INFO", f"音乐下载器: 验证通过 {cand.url[:80]} ({why})")
+                    else:
+                        rejected += 1
+                        logger.debug(f"嗅探排除 {cand.url[:80]}: {why}")
+            ctx.notify(
+                "INFO" if verified else "WARNING",
+                f"音乐下载器: 嗅探结果 —— 验证通过 {len(verified)} 个, 排除 {rejected} 个"
+                + ("" if verified else "(站点的音频地址可能需登录/付费, 或不在这些接口里)"),
+            )
+            return verified
+        except Exception as exc:  # noqa: BLE001 - 嗅探失败不影响其它取址路径
+            logger.warning(f"网络嗅探失败({type(exc).__name__}): {exc}")
+            ctx.notify("WARNING", f"音乐下载器: 网络嗅探失败({type(exc).__name__}), 已跳过")
+            return []
 
     async def after_extract(self, ctx: PluginContext, items: list[dict[str, Any]]):
         configured = str(ctx.config.get("item_field") or "").strip()
@@ -166,6 +257,15 @@ class MusicDownloaderPlugin(BasePlugin):
         if selector:
             for raw in await urls_from_dom(ctx.page, selector, "src", limit=limit):
                 collected.append((absolute_url(ctx.url, raw), None))
+
+        # 内嵌网络抓包: 页面里找不到地址时, 从捕获的接口响应里翻。
+        #
+        # **很多音乐站就是这样**: 实测酷我音乐的搜索接口只返回 rid、播放页只请求歌词、
+        # 点播放也不产生地址请求 —— 页面上根本没有可下的地址。这种站点只能靠
+        # "翻接口 + 逐个试探验证"。详见 `._media_sniff` 的模块说明。
+        if bool(ctx.config.get("sniff_network", True)):
+            sniffed = await self._sniff_audio_urls(ctx, limit)
+            collected.extend((u, None) for u in sniffed)
 
         deduped: list[tuple[str, Optional[int]]] = []
         seen: set[str] = set()

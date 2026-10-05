@@ -195,19 +195,35 @@ _ANALYZE_JS = r"""
         const a = el.closest ? el.closest('a[href]') : null;
         const href = a ? (a.getAttribute('href') || '') : '';
         const t = (text || '').trim();
-        // 组合信号: URL 路径 + 文案关键词(中英日)
-        const probe = (href + ' ' + t).toLowerCase();
+
+        // 收集"上下文文本": 元素自身的 class/id + 祖先前 3 层的 class/id/name。
+        //
+        // **为什么必须看祖先**: 实测酷我搜索结果的歌手/专辑两列是没有 class 的裸 <span>:
+        //     <div class="song_artist"><span title="郑浩&冰洁">郑浩&冰洁</span></div>
+        //     <div class="song_album"><span title="琵琶曲">琵琶曲</span></div>
+        // 只看元素自身只会得到 tag 名 "span"(用户看到的就是这个), 而语义其实写在**父元素的
+        // class** 里 —— 往上多看一层就能准确判成 artist / album。
+        let ctx = ((el.className || '').toString()) + ' ' +
+                  (el.id || '') + ' ' + (el.getAttribute('name') || '');
+        let up = el.parentElement;
+        for (let depth = 0; up && depth < 3; depth++, up = up.parentElement) {
+            ctx += ' ' + ((up.className || '').toString()) + ' ' +
+                   (up.id || '') + ' ' + (up.getAttribute('name') || '');
+        }
+
+        // 组合信号: URL 路径 + 自身文案 + 祖先 class(id/name 也算)
+        const probe = (href + ' ' + t + ' ' + ctx).toLowerCase();
         const rules = [
             // 作者/用户类
-            [/\/artist|\/musician|\/singer|歌手|艺术家|艺人|演唱|artist/i, 'artist'],
-            [/\/album|\/disc|专辑|唱片|album/i, 'album'],
-            [/\/user|\/uid|\/member|\/profile|\/author|用户|作者|博主|up主|uploader|\buser\b|\bauthor\b/i, 'user'],
+            [/\/artist|\/musician|\/singer|artist|singer|歌手|艺术家|艺人|演唱|author|performer/i, 'artist'],
+            [/\/album|\/disc|album|专辑|唱片/i, 'album'],
+            [/\/user|\/uid|\/member|\/profile|\/author|user|author|uploader|用户|作者|博主|up主/i, 'user'],
             // 时长/日期/计数类
-            [/^\d{1,2}:\d{2}(:\d{2})?$|时长|duration|length/i, 'duration'],
-            [/\d{4}-\d{1,2}-\d{1,2}|\d{1,2}\/\d{1,2}\/\d{4}|日期|发布时间|发布于|date|time/i, 'date'],
-            [/播放|收听|播放量|play\s*count|views?|播放次数/i, 'play_count'],
-            [/评论|回复|comment|repl/i, 'comment_count'],
-            [/专辑|所属专辑/i, 'album'],
+            [/^\d{1,2}:\d{2}(:\d{2})?$|song_?time|duration|时长|length/i, 'duration'],
+            [/\d{4}-\d{1,2}-\d{1,2}|\d{1,2}\/\d{1,2}\/\d{4}|song_?date|日期|发布时间|发布于|date|time/i, 'date'],
+            [/play_?count|播放|收听|播放量|views?|播放次数/i, 'play_count'],
+            [/comment_?count|评论|回复|comment|repl/i, 'comment_count'],
+            [/\bsong_?name\b|歌名|歌曲名|曲名/i, 'title'],
             [/类型|分类|标签|category|genre|tag/i, 'category'],
         ];
         for (const [re, name] of rules) {
