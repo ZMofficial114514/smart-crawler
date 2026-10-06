@@ -802,6 +802,9 @@ pre.json {
   flex: 1;
 }
 .candidate__body { padding: var(--sp-4) 15px; display: flex; flex-direction: column; gap: var(--sp-3); }
+/* 候选卡片右上角的操作区。margin-left:auto 把它推到最右 —— .candidate__head 是 flex 且
+   选择器文本会占满可用宽度, 不给 auto 的话按钮会紧贴在文本后面, 一长就看不见了。 */
+.candidate__actions { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); flex: none; }
 
 .field-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .field-chip {

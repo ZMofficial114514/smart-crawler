@@ -446,9 +446,139 @@ _ANALYZE_JS = r"""
     //: 当前生效的区域元素(由 ANALYZE 的 scope 参数设置), null 表示整页。
     let REGION_ROOT = null;
 
+    //: 区域内是否找到了候选。没找到时要往祖先方向再试一次, 见 findListsFrom。
+    let REGION_HAD_CANDIDATES = false;
+
     const withinRegion = (el, root) => {
         if (!root || !el) return true;
         return root === el || root.contains(el);
+    };
+
+    //: region 模式下的"列表容器"判据 —— 只看"有没有重复子元素", **不限定标签**。
+    //:
+    //: 搜全页时 `detectLists` 只扫 `ul/ol/table tbody/div/section/main/article`。这在那里的
+    //: 代价很小(页面里容器多得是, 漏几个无所谓), 但区域模式下会致命: 用户在**某一个列表项**
+    //: 上点「只抓取这一块」, 传进来的区域就是 `<li class="item">` 这类叶子容器 —— 按上面的
+    //: 标签白名单, 它自己先被排除, 里面也没有合格的容器, 结果是"区域里 0 个候选"。
+    const looksLikeListContainer = (el) => {
+        if (SKIP[el.tagName]) return false;
+        const kids = Array.from(el.children).filter(
+            c => !SKIP[c.tagName] && (
+                ((c.innerText || '')).trim().length > 10 ||
+                c.querySelector('a[href], img[src]')
+            )
+        );
+        if (kids.length < 3) return false;
+        // 至少 3 个同类子元素才像"重复结构", 否则可能只是一堆无关的子节点
+        const groups = new Map();
+        kids.forEach(c => {
+            const sig = c.tagName + '|' + stableClasses(c).slice().sort().join('.');
+            groups.set(sig, (groups.get(sig) || 0) + 1);
+        });
+        return Array.from(groups.values()).some(n => n >= 3);
+    };
+
+    //: 从区域内找候选; 找不到就**沿祖先向上**找最近的列表容器再试一次。
+    //:
+    //: 用户点选的是"我看到的那块内容", 它可能是一个列表项、一个包裹层、甚至就是列表本身;
+    //: 而 `detectLists` 要求"容器里有重复子元素"。只从区域内看会漏掉一个常见情形: 区域本身
+    //: 就是那个列表(如 `ul.search_list`), 它的子元素是 `<li>`, 而 `li` 不在容器的标签白名单里,
+    //: 于是区域内 0 候选。往上走一层拿它的父元素当容器, 立刻就能识别出来。
+    //:
+    //: 这里**只向上走 2 层**并加了 `withinRegion` 之外的额外约束(不能跑到 body):
+    //: 走太远会把用户明确排除掉的导航/页脚又拉回来, 那就违背了"只抓这一块"的意图。
+    //: 把"某个元素自己就是列表容器"这一情形转成候选。
+    //:
+    //: **为什么需要单独一个函数**: `detectLists(X)` 是在 **X 内部**找容器, 恰好跳过 X 自己。
+    //: 而用户点「只抓取这一块」时, 区域很可能就是列表本身(`ul.search_list`)或一个列表项
+    //: (`li.song_item`) —— 这两种情形下真正要识别的容器是它们的**父元素**, 而父元素不在
+    //: `detectLists` 的扫描范围内(扫描的是 X 的后代)。所以这里手工构造候选: 直接按
+    //: "父元素选择器 > 同类子元素" 的形式拼出 item_selector, 与 `detectLists` 的口径一致。
+    const candidateFromContainer = (container) => {
+        if (!container || !looksLikeListContainer(container)) return null;
+        const kids = Array.from(container.children).filter(
+            c => !SKIP[c.tagName] && (
+                ((c.innerText || '')).trim().length > 10 ||
+                c.querySelector('a[href], img[src]')
+            )
+        );
+        if (kids.length < 3) return null;
+        const groups = new Map();
+        kids.forEach(c => {
+            const sig = c.tagName + '|' + stableClasses(c).slice().sort().join('.');
+            if (!groups.has(sig)) groups.set(sig, []);
+            groups.get(sig).push(c);
+        });
+        const parentSel = uniqSelector(container);
+        let best = null;
+        for (const arr of groups.values()) {
+            if (arr.length < 3) continue;
+            const tag = arr[0].tagName.toLowerCase();
+            const cls = stableClasses(arr[0]);
+            let itemSel = null;
+            if (cls.length) {
+                const cand = parentSel + ' > ' + tag + '.' + cls.map(cssEscape).join('.');
+                if (document.querySelectorAll(cand).length >= arr.length) itemSel = cand;
+            }
+            if (!itemSel) itemSel = parentSel + ' > ' + tag;
+            const hits = document.querySelectorAll(itemSel).length;
+            if (hits < 3) continue;
+            if (!best || hits > best.count) {
+                best = {
+                    item_selector: itemSel,
+                    container_selector: parentSel,
+                    count: hits,
+                    sample_fields: sampleFields(arr[0]),
+                    sample_html: arr[0].outerHTML.slice(0, 2000),
+                };
+            }
+        }
+        return best;
+    };
+
+    const findListsFrom = (regionEl) => {
+        if (!regionEl) return detectLists(null);
+        const direct = detectLists(regionEl);
+        if (direct.length) {
+            REGION_HAD_CANDIDATES = true;
+            return direct;
+        }
+        // 区域内没有候选, 说明被点中的是**列表项**或**列表本身**, 而不是它们的容器。
+        // 两种情形要分别处理:
+        //   1. 区域**自己**就是列表(如 `ul.search_list`) -> 直接按容器识别它;
+        //   2. 区域是列表项(如 `li.song_item`)        -> 它的父元素才是容器, 向上找。
+        // 向上最多 2 层且不许到 body: 走太远会把用户明确排除掉的导航/页脚又拉回来, 正好
+        // 违背"只抓这一块"的意图。
+        const self = candidateFromContainer(regionEl);
+        if (self) {
+            REGION_HAD_CANDIDATES = true;
+            return [self];
+        }
+        // 再判断"区域是不是重复项之一"。**只有是**才允许向上找容器。
+        //
+        // 这条约束防的是一种误伤: 用户点在**标题文字**上(`div.song_name`), 它自己不是列表,
+        // 但它的父元素正好有 20 个同类兄弟 —— 一旦向上爬, 就会把整个歌曲列表拉回来, 而用户
+        // 选的是那一小块文字。这正是验收里"区域内没有列表时不偷拿区域外的"要挡住的情形。
+        // 仅当区域本身与 ≥3 个同类兄弟并列时, 才说明它是"某个列表的一项", 向上找才有依据。
+        const sig = (el) => el.tagName + '|' + stableClasses(el).slice().sort().join('.');
+        const parent = regionEl.parentElement;
+        let siblings = 0;
+        if (parent) {
+            const mySig = sig(regionEl);
+            siblings = Array.from(parent.children).filter(c => sig(c) === mySig).length;
+        }
+        if (siblings < 3) return direct;
+
+        let cur = parent;
+        for (let up = 0; up < 2 && cur && cur !== document.body; up++) {
+            const made = candidateFromContainer(cur);
+            if (made) {
+                REGION_HAD_CANDIDATES = true;
+                return [made];
+            }
+            cur = cur.parentElement;
+        }
+        return direct;
     };
 
     //: 把"区域选择器"解析成元素。支持三种写法:
@@ -506,8 +636,18 @@ _ANALYZE_JS = r"""
                 if (!itemSel) itemSel = parentSel + ' > ' + tag;
                 const hits = document.querySelectorAll(itemSel).length;
                 if (hits < 3 || seen.has(itemSel)) continue;
-                // 限定区域时, 候选必须真的落在区域内 —— 否则用户"只抓这一块"的意图会落空。
-                if (root && !withinRegion(parent, root)) continue;
+                // 限定区域时, 候选必须与区域真的相关 —— 否则用户"只抓这一块"的意图会落空。
+                //
+                // 判据是**双向**的: 区域在容器里, 或容器在区域里, 都算相关。只认单向
+                // (容器必须在区域内)会误杀两种最关键的情形, 而它们正是用户点「只抓取这一块」
+                // 时最可能传进来的值:
+                //   - 区域 = 单个列表项 `li.song_item`: 容器是它的父元素 `ul.search_list`,
+                //     该 ul **并不在 li 内部**, 单向判据直接失配;
+                //   - 区域 = 列表本身 `ul.search_list`: 容器是包着 ul 的那个 div, 同理失配。
+                // 回退逻辑(见 findListsFrom)有意沿祖先向上找列表容器, 所以容器比区域"大一层"
+                // 是**预期行为**, 不是越界。
+                if (root && !(root.contains(parent) || parent.contains(root)
+                              || parent === root)) continue;
                 seen.add(itemSel);
                 candidates.push({
                     item_selector: itemSel,
@@ -877,6 +1017,9 @@ _ANALYZE_JS = r"""
     // 解析失败就按整页处理 —— 宁可多给候选, 也不要因为一个笔误让分析整个没用。
     const regionEl = resolveRegion(scope);
     REGION_ROOT = regionEl;
+    REGION_HAD_CANDIDATES = false;
+    // 候选要在 regionInfo 之前先算出来, 好把"区域内到底有没有候选"一起回显。
+    const regionCandidates = regionEl ? findListsFrom(regionEl) : detectLists(null);
     const regionInfo = regionEl ? {
         selector: scope,
         matched: true,
@@ -885,7 +1028,10 @@ _ANALYZE_JS = r"""
         unique_selector: uniqSelector(regionEl),
         text_len: ((regionEl.innerText || '')).trim().length,
         elements: regionEl.querySelectorAll('*').length,
-    } : { selector: (scope || ''), matched: false };
+        //: 区域内识别出的候选数。为 0 时界面要提示"这一块里没找到列表结构",
+        //: 否则用户会以为是功能坏了, 而不是"选中的这块确实没有可提取的列表"。
+        candidates: regionCandidates.length,
+    } : { selector: (scope || ''), matched: false, candidates: regionCandidates.length };
 
     // 区域内的结构树: 从区域元素起画, 而不是整页 body。
     //
@@ -897,7 +1043,7 @@ _ANALYZE_JS = r"""
 
     return {
         title: document.title || '',
-        candidates: detectLists(regionEl),
+        candidates: regionCandidates,
         region: regionInfo,
         pagination: detectPagination(),
         metadata: collectMetadata(),
@@ -1283,6 +1429,7 @@ class StructureAnalyzer:
         )
         report.scope = str(scope or "")
         report.scope_matched = bool(region.get("matched"))
+        report.scope_candidates = int(region.get("candidates") or 0)
         # 把"正文到底有没有被抓到"记进日志。这是本模块最隐蔽的失效模式:
         # 树看着挺长(全是导航), 但数据区一张图都没有, 而界面与调用方都察觉不到。
         imgs_dom = int(tree_info.get("images_in_dom") or 0)

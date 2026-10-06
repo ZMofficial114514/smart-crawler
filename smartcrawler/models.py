@@ -139,6 +139,12 @@ class PageStructureReport(BaseModel):
     #: **必须回显**: 选择器写错时页面上什么也匹配不到, 若静默按整页分析, 用户会以为
     #: "限定没生效"或者"这功能没用", 而实际只是选择器打错了字。
     scope_matched: bool = Field(default=False, description="限定区域选择器是否匹配到元素")
+    #: 限定区域内识别出的候选列表数。
+    #:
+    #: 与 `scope_matched` 分开: 选择器可能命中了一个元素, 但那一块里确实没有列表结构
+    #: (用户点在了标题或按钮上)。这时要如实说"这块里没找到列表", 而不是让用户对着
+    #: 空候选猜原因。
+    scope_candidates: int = Field(default=0, description="限定区域内识别出的候选列表数")
     candidate_lists: list[ListCandidate] = Field(default_factory=list, description="候选列表区")
     pagination: Optional[PaginationInfo] = None
     metadata: dict[str, Any] = Field(

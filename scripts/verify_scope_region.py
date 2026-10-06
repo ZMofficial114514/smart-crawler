@@ -123,6 +123,38 @@ async def main() -> int:
         check(scoped.simplified_tree.lstrip().startswith(probe["tag"]),
               "树从区域元素起画", scoped.simplified_tree.splitlines()[0][:60])
 
+        print("\n=== 3b) 模拟点候选卡片上的「只抓取这一块」===")
+        # 按钮传的是 container_selector, 而容器**未必是列表本身**。三种真实情形都要能工作:
+        #   a) 容器是列表的父元素(如 div.child_view) -> 区域内直接找到
+        #   b) 容器就是列表本身(如 ul.search_list)   -> 需要向上找一层才认得出
+        #   c) 容器是单个列表项(如 li.song_item)     -> 同上, 这是用户最可能点到的东西
+        for label, sel in (
+            ("容器=列表的父元素", "div.child_view"),
+            ("容器=列表本身", "ul.search_list"),
+            ("容器=单个列表项", "li.song_item"),
+        ):
+            if not await page.evaluate("(s) => !!document.querySelector(s)", sel):
+                print(f"    {label:<18} {sel:<22} (页面上没有, 跳过)")
+                continue
+            rep = await analyzer.analyze(page, scope=sel)
+            n = len(rep.candidate_lists)
+            top = rep.candidate_lists[0].item_selector if n else ""
+            ok = n > 0 and "song_item" in top
+            mark = "✓" if ok else "✗"
+            print(f"    {mark} {label:<18} scope={sel:<22} 候选={n}  首个={top[:44]}")
+            if not ok:
+                failures.append(f"「只抓取这一块」在 {label}({sel}) 上没找到目标列表")
+
+        small_item = await page.evaluate(
+            """() => {
+                const li = document.querySelector('li.song_item');
+                if (!li) return null;
+                return { items: li.querySelectorAll('*').length,
+                         text: (li.innerText||'').trim().slice(0, 40) };
+            }"""
+        )
+        print(f"    单个列表项规模 = {small_item}")
+
         print("\n=== 4) 选择器写错时必须明确报告 ===")
         bad = await analyzer.analyze(page, scope="div#this-does-not-exist-xyz")
         check(not bad.scope_matched, "**写错时 scope_matched = False**",

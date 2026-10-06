@@ -69,10 +69,23 @@ function renderStats(report, networkStats) {
 
 function candidateCard(candidate, index) {
   const fields = candidate.sample_fields || [];
+  // 点这个按钮 = "我只要这一块": 把抓取区域设成**该候选所在容器**, 再分析一次。
+  //
+  // 为什么用容器选择器而不是列表自身的 item_selector: 用户要的是"这个候选列表所在的那块
+  // 区域", 容器是它的边界。用 item_selector 当区域也能收窄, 但容器才是语义上的"这一块"。
+  // container_selector 由分析器保证是页面上唯一的, 所以能直接当 scope 用。
+  const scopeFor = candidate.container_selector || candidate.item_selector;
   return el('div.candidate', { style: { animationDelay: `${index * 60}ms` } }, [
     el('div.candidate__head', {}, [
       el('span.tag', { text: `${candidate.count} 项` }),
       copyable(candidate.item_selector),
+      el('div.candidate__actions', {}, [
+        el('button.btn.btn--sm.btn--primary', {
+          text: '只抓取这一块',
+          title: `只分析该候选所在区域(${scopeFor}), 页面上其它列表不再进入候选`,
+          onclick: () => scopeToRegion(scopeFor),
+        }),
+      ]),
     ]),
     el('div.candidate__body', {}, [
       candidate.container_selector
@@ -101,6 +114,26 @@ function candidateCard(candidate, index) {
         : null,
     ]),
   ]);
+}
+
+/**
+ * 把抓取区域设为给定选择器, 并立刻用它重新分析一次。
+ *
+ * 数据流: 用户点候选卡片上的「只抓取这一块」-> 选择器写进输入框 -> 走 startAnalyze 的
+ * 同一条路径。**复用同一条路径**是有意的: 区域既能从界面手动填, 也能从这里一键设定,
+ * 两者行为必须完全一致, 否则又会出现"按钮点出来的结果和手填的不一样"这种难查的问题。
+ * 把选择器回填到输入框还有两个好处: 用户看得见到底限定成了什么, 想微调可以直接改。
+ */
+function scopeToRegion(selector) {
+  const value = String(selector || '').trim();
+  if (!value) {
+    toastError('这个候选没有可用的容器选择器');
+    return;
+  }
+  const field = $('#analyzeScope');
+  if (field) field.value = value;
+  toastInfo(`已限定为这一块,正在只分析 ${truncate(value, 48)} …`);
+  startAnalyze();
 }
 
 function renderReport(payload) {
@@ -179,17 +212,29 @@ function renderReport(payload) {
         el('h2', { text: report.title || '未取到标题' }),
         el('span.tag.tag--ghost', { text: report.url || '' }),
       ]),
-      // 限定区域的结果必须回显 —— 选择器写错时页面上什么都匹配不到, 若静默按整页分析,
-      // 用户会以为"限定没生效", 而实际只是选择器打错了字。
+      // 限定区域的三种结果要分开说, 否则用户只能靠猜:
+      //   命中且有候选 -> 确认限定了什么;
+      //   命中但 0 候选 -> 这块里确实没有列表(点到了标题/按钮), 不是功能坏了;
+      //   没命中       -> 选择器写错了。
       report.scope
         ? (report.scope_matched
-            ? el('div.alert.alert--info', {}, [
-                el('div.alert__body', {}, [
-                  el('span', { text: '已限定抓取区域: ' }),
-                  copyable(report.scope),
-                  el('span.hint', { text: ' —— 候选列表与结构树都只来自这一块。' }),
-                ]),
-              ])
+            ? (report.scope_candidates
+                ? el('div.alert.alert--info', {}, [
+                    el('div.alert__body', {}, [
+                      el('span', { text: '已限定抓取区域: ' }),
+                      copyable(report.scope),
+                      el('span.hint', {
+                        text: ` —— 区域内 ${report.scope_candidates} 个候选列表,`
+                          + '其它区域不再参与。',
+                      }),
+                    ]),
+                  ])
+                : el('div.alert.alert--warn', {}, [
+                    el('div.alert__body', {
+                      text: `抓取区域 ${report.scope} 命中了元素, 但这一块里没有识别出列表结构`
+                        + '(可能点在标题、按钮或单条内容上)。请改点列表项或它所在的容器。',
+                    }),
+                  ]))
             : el('div.alert.alert--warn', {}, [
                 el('div.alert__body', {
                   text: `抓取区域 ${report.scope} 在页面上没有匹配到元素, 已按整页分析。`
