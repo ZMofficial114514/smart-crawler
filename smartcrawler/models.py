@@ -129,6 +129,16 @@ class PageStructureReport(BaseModel):
     #: 955 个元素、150 条歌曲记录)。分析器会下探到内容最丰富的同源 frame 并把名称记在
     #: 这里, 提取时按同一 frame 取数, 否则分析与提取看的是两个不同的文档。
     content_frame: str = Field(default="", description="内容所在的 iframe 名称, 空表示主文档")
+    #: 用户限定的分析区域选择器(空表示整页)。
+    #:
+    #: 对应"我只想爬页面的一部分": 候选列表与结构树都只在这个区域内生成, 页头导航、
+    #: 侧栏推荐、页脚链接就不会混进候选、也不会被规则抓到。
+    scope: str = Field(default="", description="限定分析区域的选择器, 空表示整页")
+    #: 区域选择器是否真的在页面上匹配到了元素。
+    #:
+    #: **必须回显**: 选择器写错时页面上什么也匹配不到, 若静默按整页分析, 用户会以为
+    #: "限定没生效"或者"这功能没用", 而实际只是选择器打错了字。
+    scope_matched: bool = Field(default=False, description="限定区域选择器是否匹配到元素")
     candidate_lists: list[ListCandidate] = Field(default_factory=list, description="候选列表区")
     pagination: Optional[PaginationInfo] = None
     metadata: dict[str, Any] = Field(

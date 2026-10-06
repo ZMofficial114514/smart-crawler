@@ -179,6 +179,24 @@ function renderReport(payload) {
         el('h2', { text: report.title || '未取到标题' }),
         el('span.tag.tag--ghost', { text: report.url || '' }),
       ]),
+      // 限定区域的结果必须回显 —— 选择器写错时页面上什么都匹配不到, 若静默按整页分析,
+      // 用户会以为"限定没生效", 而实际只是选择器打错了字。
+      report.scope
+        ? (report.scope_matched
+            ? el('div.alert.alert--info', {}, [
+                el('div.alert__body', {}, [
+                  el('span', { text: '已限定抓取区域: ' }),
+                  copyable(report.scope),
+                  el('span.hint', { text: ' —— 候选列表与结构树都只来自这一块。' }),
+                ]),
+              ])
+            : el('div.alert.alert--warn', {}, [
+                el('div.alert__body', {
+                  text: `抓取区域 ${report.scope} 在页面上没有匹配到元素, 已按整页分析。`
+                    + '请检查选择器是否写对 —— 它必须是页面里真实存在的 CSS 选择器。',
+                }),
+              ]))
+        : null,
       renderStats(report, payload.network_stats),
       report.pagination?.next_selector
         ? el('div.pager-info', {}, [
@@ -312,6 +330,10 @@ function handoffToCrawl(report) {
   if (box) box.value = JSON.stringify(rule, null, 2);
   const urlInput = $('#crawlUrl');
   if (urlInput && report.url) urlInput.value = report.url;
+  // 把"抓取区域"一起带过去 —— 否则用户在这里限定了区域, 切到抓取页却变回整页,
+  // 生成的规则与实际抓取的范围不一致。
+  const scopeOut = $('#crawlScope');
+  if (scopeOut) scopeOut.value = report.scope || '';
 
   toastSuccess('已把候选结构填入抓取页的规则编辑器');
   goToPage('crawl');
@@ -367,6 +389,11 @@ async function startAnalyze(opts = {}) {
   try {
     const { task } = await api.startAnalyze({
       url,
+      // 抓取区域: 只在这一块里找候选列表并生成规则。
+      //
+      // 用户的实际诉求是"我只想爬页面的一部分", 而整页分析会把页头导航、侧栏推荐、
+      // 页脚链接一起当成候选, 规则也就跟着抓那些。留空 = 整页, 与旧行为一致。
+      scope: ($('#analyzeScope')?.value || '').trim(),
       deep_scroll: opts.deepScroll || 0,
     });
     activeTaskId = task.id;

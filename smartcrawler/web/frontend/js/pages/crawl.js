@@ -79,6 +79,9 @@ function collectPayload() {
     ask_scroll: $('#crawlAskScroll')?.checked !== false,
     // 下载数量: 留空则后端先从"抓取目标"里解析(如"爬取前三张"), 再退回插件配置
     media_limit: numberOrNull($('#crawlMediaLimit')?.value),
+    // 抓取区域: 只在这一块里找候选列表, 页头导航/侧栏/页脚不会混进候选。
+    // 留空 = 整页, 与旧行为一致。
+    scope: ($('#crawlScope')?.value || '').trim(),
   };
   return payload;
 }

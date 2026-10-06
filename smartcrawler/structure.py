@@ -29,7 +29,7 @@ from .utils import truncate
 # 说明: 故意不使用 f-string, 避免花括号转义问题
 # ---------------------------------------------------------------------------
 _ANALYZE_JS = r"""
-() => {
+(scope) => {
     // 不参与结构树的标签。
     //
     // `TEXTAREA` / `INPUT` / `SELECT` / `OPTION` 的加入来自实测: 网易云音乐把
@@ -434,11 +434,46 @@ _ANALYZE_JS = r"""
         return dropRedundantFields(sample, fields);
     };
 
+    // ---- 限定区域支持 ----
+    //
+    // 用户经常只想抓页面的一部分(比如只要中间的作品列表, 不要侧边的推荐与页脚的导航)。
+    // 原先 `detectLists` 一律扫全页, 于是候选里混进导航/推荐/页脚, 规则也会抓到那些。
+    //
+    // 这里把"区域"做成两个作用:
+    //   1. `detectLists(root)` 只从区域内找候选 —— 直接的过滤;
+    //   2. `withinRegion(el, root)` 供候选校验 —— 双保险, 避免选择器跨出区域。
+
+    //: 当前生效的区域元素(由 ANALYZE 的 scope 参数设置), null 表示整页。
+    let REGION_ROOT = null;
+
+    const withinRegion = (el, root) => {
+        if (!root || !el) return true;
+        return root === el || root.contains(el);
+    };
+
+    //: 把"区域选择器"解析成元素。支持三种写法:
+    //:   - 用户直接用鼠标在页面上点选 -> 前端传回唯一选择器;
+    //:   - 手填 CSS 选择器;
+    //:   - 传 "body" / 留空 -> 整页。
+    const resolveRegion = (selector) => {
+        const sel = (selector || '').trim();
+        if (!sel || sel === 'body' || sel === 'html') return null;
+        try {
+            const el = document.querySelector(sel);
+            if (el && el !== document.body && el !== document.documentElement) return el;
+        } catch (e) { /* 非法选择器, 按整页处理 */ }
+        return null;
+    };
+
     // ---- 重复结构识别 ----
-    const detectLists = () => {
+    //
+    // `root` 用于**限定分析范围**: 用户只想抓页面的一部分时, 从这里开始找候选列表,
+    // 页面上其它区域(页头导航、侧边栏、推荐位)就不会再产生候选。
+    const detectLists = (root) => {
+        const scope = root || document;
         const candidates = [];
         const seen = new Set();
-        const containers = document.querySelectorAll('ul, ol, table tbody, div, section, main, article');
+        const containers = scope.querySelectorAll('ul, ol, table tbody, div, section, main, article');
         containers.forEach(parent => {
             if (candidates.length >= 12) return;
             // 认定"这是一个列表项"的条件(满足其一):
@@ -471,6 +506,8 @@ _ANALYZE_JS = r"""
                 if (!itemSel) itemSel = parentSel + ' > ' + tag;
                 const hits = document.querySelectorAll(itemSel).length;
                 if (hits < 3 || seen.has(itemSel)) continue;
+                // 限定区域时, 候选必须真的落在区域内 —— 否则用户"只抓这一块"的意图会落空。
+                if (root && !withinRegion(parent, root)) continue;
                 seen.add(itemSel);
                 candidates.push({
                     item_selector: itemSel,
@@ -771,7 +808,8 @@ _ANALYZE_JS = r"""
             .map(x => x.c);
     };
 
-    const simplifiedTree = (maxDepth, maxNodes) => {
+    const simplifiedTree = (maxDepth, maxNodes, fromEl) => {
+        const startEl = fromEl || document.body;
         const lines = [];
         let nodes = 0;
         const walk = (el, depth, prefix) => {
@@ -816,7 +854,7 @@ _ANALYZE_JS = r"""
             orderedChildren(el).slice(0, TREE_CHILD_CAP)
                 .forEach(c => walk(c, depth + 1, nextPrefix));
         };
-        walk(document.body, 0, '');
+        walk(startEl, 0, '');
         return lines.join('\n');
     };
 
@@ -833,11 +871,34 @@ _ANALYZE_JS = r"""
     // 界面上那个提示永远不会出现, 用户无从知道结构树其实不完整。
     const truncated = { nodes: false, depth: 0 };
 
-    const tree = simplifiedTree(TREE_MAX_DEPTH, TREE_MAX_NODES);
+    // ---- 生效的用户指定区域 ----
+    //
+    // 这是"只抓页面一部分"的入口: `scope` 是用户点选(或手填)的元素选择器。
+    // 解析失败就按整页处理 —— 宁可多给候选, 也不要因为一个笔误让分析整个没用。
+    const regionEl = resolveRegion(scope);
+    REGION_ROOT = regionEl;
+    const regionInfo = regionEl ? {
+        selector: scope,
+        matched: true,
+        tag: regionEl.tagName.toLowerCase(),
+        // 区域自身的选择器与规模, 回显给界面确认"选中的是哪一块"
+        unique_selector: uniqSelector(regionEl),
+        text_len: ((regionEl.innerText || '')).trim().length,
+        elements: regionEl.querySelectorAll('*').length,
+    } : { selector: (scope || ''), matched: false };
+
+    // 区域内的结构树: 从区域元素起画, 而不是整页 body。
+    //
+    // **为什么树也要跟着缩**: 如果候选只从区域内出、树却仍是整页, 用户会在树里看到一堆
+    // 与本次抓取无关的节点, 既浪费 token 预算, 也让 AI 更容易把字段指到区域外。
+    const tree = regionEl
+        ? simplifiedTree(TREE_MAX_DEPTH, TREE_MAX_NODES, regionEl)
+        : simplifiedTree(TREE_MAX_DEPTH, TREE_MAX_NODES);
 
     return {
         title: document.title || '',
-        candidates: detectLists(),
+        candidates: detectLists(regionEl),
+        region: regionInfo,
         pagination: detectPagination(),
         metadata: collectMetadata(),
         tree: tree,
@@ -863,11 +924,17 @@ class StructureAnalyzer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def _pick_richest_frame(self, page: Page) -> tuple[Any, str, Any]:
+    async def _pick_richest_frame(
+        self, page: Page, scope: str = ""
+    ) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None]:
         """遍历同源 frame 各做一次分析, 返回内容最丰富的那个。
 
         返回 ``(raw, frame_name, main_raw)``; 全都读不到时 ``raw`` 为 ``None``。
         打分顺序: 候选列表数 > 元素数 > 图片数 —— 先把"有没有可提取的列表"放在首位。
+
+        :param scope: 用户指定的**分析区域选择器**; 为空则整页。区域内没有匹配时,
+            各 frame 的候选都会是空的, 于是选中的 frame 可能不是最丰富那个 —— 因此
+            区域分析下不再按"候选数"打分, 而是优先取**区域真的匹配上**的那个 frame。
         """
         best_raw: dict[str, Any] | None = None
         best_name = ""
@@ -878,7 +945,7 @@ class StructureAnalyzer:
         frame_sizes: list[str] = []
         for frame in self._accessible_frames(page):
             try:
-                raw: dict[str, Any] = await frame.evaluate(_ANALYZE_JS)
+                raw: dict[str, Any] = await frame.evaluate(_ANALYZE_JS, scope or "")
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"frame 分析失败({getattr(frame, 'url', '')[:60]}): {exc}")
                 continue
@@ -887,8 +954,14 @@ class StructureAnalyzer:
                 main_raw = raw
             stats = raw.get("dom_stats") or {}
             el = int(stats.get("total_elements") or 0)
-            frame_sizes.append(f"{name or '(主文档)'}={el}/{len(raw.get('candidates') or [])}候选")
-            score = (len(raw.get("candidates") or []), el, int(stats.get("images") or 0))
+            region = raw.get("region") or {}
+            matched = 1 if region.get("matched") else 0
+            frame_sizes.append(
+                f"{name or '(主文档)'}={el}/{len(raw.get('candidates') or [])}候选"
+                + (f"/区域{'✓' if matched else '✗'}" if scope else "")
+            )
+            score = (matched if scope else 0,
+                     len(raw.get("candidates") or []), el, int(stats.get("images") or 0))
             if best_score is None or score > best_score:
                 best_raw, best_name, best_score = raw, name, score
         logger.info(f"frame 规模: {', '.join(frame_sizes) or '(无可读 frame)'}")
@@ -1127,7 +1200,7 @@ class StructureAnalyzer:
             out.append(f)
         return out
 
-    async def analyze(self, page: Page) -> PageStructureReport:
+    async def analyze(self, page: Page, scope: str = "") -> PageStructureReport:
         """对当前页面执行结构分析, 返回结构报告。
 
         **会下探到同源 iframe。** 部分站点(实测网易云音乐)采用"外壳 + 内嵌 iframe":
@@ -1135,6 +1208,10 @@ class StructureAnalyzer:
         候选列表是 0, 要么报"没有可提取的列表", 要么从外壳里提出一堆导航链接。
         因此先分析主文档, 若没有候选列表, 再依次分析各同源子 frame, 取内容最丰富的那个,
         并把 frame 名称记进报告, 供提取阶段使用同一个 frame。
+
+        :param scope: 用户指定的**区域选择器**(如 ``div#content > ul.list``)。非空时只在该
+            区域内找候选列表、只画该区域的结构树 —— 用于"我只想爬页面的一部分"。
+            区域没匹配上时按整页处理, 并把 ``region.matched=false`` 记进报告, 界面可据此提示。
         """
         url = page.url
         # iframe 里的内容常常晚于主文档渲染完成(实测网易云音乐: 外壳 domcontentloaded
@@ -1143,7 +1220,7 @@ class StructureAnalyzer:
         await self._wait_for_frames_to_settle(page)
         await self._wait_for_playwright_frames(page)
 
-        raw, frame_name, main_raw = await self._pick_richest_frame(page)
+        raw, frame_name, main_raw = await self._pick_richest_frame(page, scope)
         if raw is None:
             logger.error(f"页面结构分析失败 {url}: 所有 frame 都不可读")
             return PageStructureReport(url=url, title="")
@@ -1159,7 +1236,7 @@ class StructureAnalyzer:
         if reason:
             logger.warning(f"内容疑似未到位({reason}) —— 重新加载页面后再分析一次")
             if await self._reload_and_settle(page):
-                raw2, frame_name2, main_raw2 = await self._pick_richest_frame(page)
+                raw2, frame_name2, main_raw2 = await self._pick_richest_frame(page, scope)
                 if raw2 is not None and not await self._incomplete_reason(
                     page, raw2, frame_name2, main_raw2
                 ):
@@ -1174,6 +1251,20 @@ class StructureAnalyzer:
                 f"内容位于 iframe {frame_name!r}: "
                 f"主文档候选 {main_cands} 个 -> 该 frame {len(raw.get('candidates') or [])} 个"
             )
+
+        region = raw.get("region") or {}
+        if scope:
+            if region.get("matched"):
+                logger.info(
+                    f"限定区域分析: {scope!r} 命中 <{region.get('tag')}> "
+                    f"({region.get('elements')} 个元素), 区域内候选 "
+                    f"{len(raw.get('candidates') or [])} 个"
+                )
+            else:
+                logger.warning(
+                    f"限定区域 {scope!r} 在页面上没有匹配到元素 —— 已按整页分析。"
+                    "请检查选择器, 或在结构树里挑一个能定位的节点。"
+                )
 
         candidates = [ListCandidate(**c) for c in raw.get("candidates", [])]
         pag_raw = raw.get("pagination")
@@ -1190,6 +1281,8 @@ class StructureAnalyzer:
             metadata=raw.get("metadata", {}),
             dom_stats=raw.get("dom_stats", {}),
         )
+        report.scope = str(scope or "")
+        report.scope_matched = bool(region.get("matched"))
         # 把"正文到底有没有被抓到"记进日志。这是本模块最隐蔽的失效模式:
         # 树看着挺长(全是导航), 但数据区一张图都没有, 而界面与调用方都察觉不到。
         imgs_dom = int(tree_info.get("images_in_dom") or 0)

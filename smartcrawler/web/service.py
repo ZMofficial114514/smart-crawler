@@ -792,6 +792,8 @@ class CrawlService:
                 scroll_rounds=params.get("scroll_rounds"),
                 # 下载数量: 用户在抓取页填的优先, 否则由 crawler 从抓取目标里解析
                 media_limit=params.get("media_limit"),
+                # 用户限定的抓取区域 —— 只在这块里找候选与生成规则
+                scope=str(params.get("scope") or ""),
                 # 交互式续滚: 内容没上限时问用户"要不要继续", 一直到用户说不滚
                 scroll_confirm=(
                     (lambda outcome: self._ask_continue_scroll(task, outcome))
@@ -1141,6 +1143,8 @@ class CrawlService:
             task.step("navigate", "running")
             report, stats = await crawler.analyze_only(
                 task.params["url"],
+                # 用户限定的分析区域: 只在这一块里找候选列表
+                scope=str(task.params.get("scope") or ""),
                 deep_scroll=int(task.params.get("deep_scroll") or 0),
                 scroll_rounds=task.params.get("scroll_rounds"),
                 # **分析默认不阻塞询问**: 只滚一轮就直接出报告, 由报告里的

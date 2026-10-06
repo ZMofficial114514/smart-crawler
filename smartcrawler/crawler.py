@@ -393,6 +393,7 @@ class SmartCrawler:
         scroll_progress: Optional[Callable[[int, Any], None]] = None,
         scroll_rounds: Optional[int] = None,
         media_limit: Optional[int] = None,
+        scope: str = "",
     ) -> TaskResult:
         """抓取一个列表页(自动跟随分页), 返回 TaskResult。
 
@@ -544,7 +545,8 @@ class SmartCrawler:
                 # 因此这里只做**记录**, 不做自动重建 —— 让用户看到原因并自行重试, 比框架悄悄
                 # 折腾一遍再给出奇怪的半成品结果要好。恢复手段保留在 BrowserManager.recycle_context(),
                 # 供界面/调用方在明确需要时使用。
-                report = await self.structure.analyze(page)
+                # 用户限定的区域: 抓取时也要遵守, 否则界面里预览的规则与实际抓取的规则不一致。
+                report = await self.structure.analyze(page, scope=str(scope or ""))
                 if await self._page_looks_degraded(page):
                     note = ("页面内容疑似未注入(存在空的同源 iframe) —— 若结果为空, "
                             "通常是目标站点降级或限流所致, 稍后重试即可")
@@ -730,6 +732,7 @@ class SmartCrawler:
         self,
         url: str,
         *,
+        scope: str = "",
         deep_scroll: int = 0,
         scroll_confirm: Optional[Callable[..., Any]] = None,
         scroll_progress: Optional[Callable[[int, Any], None]] = None,
@@ -738,6 +741,10 @@ class SmartCrawler:
         """打开页面做结构分析 + 网络监听摘要(调试/规则设计用), 不提取数据。
 
         ``deep_scroll``: 界面上选择"继续向下滚动"时传入的额外滚动轮次(用于无限流页面)。
+
+        ``scope``: 用户限定的区域选择器 —— **只在页面这一块里找候选列表**。用于
+        "我只想爬页面的一部分": 页头导航、侧栏推荐、页脚链接不会再混进候选, 生成的规则
+        也就不会抓到它们。
 
         同时做访问受限诊断 —— 这正是用户最需要它的场景: 分析一个"看起来正常"的页面,
         然后立刻知道自己是撞上了登录重定向、权限不足还是风控页, 而不是页面真的没有
@@ -765,7 +772,7 @@ class SmartCrawler:
                 )
                 report_lazy = scroll.to_dict() if scroll else None
 
-                report = await self.structure.analyze(page)
+                report = await self.structure.analyze(page, scope=scope)
                 report.lazy_load = report_lazy
                 # 人机验证**先判**: 它的结论是权威的, 要用来纠正访问诊断的推断
                 challenge = await detect_challenge(page)

@@ -202,13 +202,39 @@ python scripts/check_plugin_docs.py    # docs/plugins.md 与代码是否脱节
 >
 > 改动框架本身(而不只是写插件)请先看 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+## 只爬页面的一部分
+
+页面上的重复结构往往不止一处 —— 页头导航、侧栏推荐、页脚链接都会各自构成"列表"。整页分析
+会把这些一起当成候选, 生成的规则也就跟着抓它们。抓取页与结构分析页都有「**抓取区域**」输入框,
+填一个 CSS 选择器即可把范围收窄:
+
+```text
+抓取区域:  div#content          # 只在这一块里找候选列表与生成规则
+抓取区域:  ul.search_list       # 或者直接指定那个列表
+抓取区域:  （留空）              # 整页, 与旧行为一致
+```
+
+效果(实测某搜索页):
+
+| | 候选列表 | 结构树 |
+|---|---|---|
+| 整页 | 7 个(含导航 5 条 / 页脚 3 条 / 推荐位…) | 761 行 |
+| 限定 `div.child_view` | **1 个**(只有目标列表) | 489 行 |
+
+区域同时作用于三处, 三者口径一致: **候选列表**只在区域内产生、**结构树**只从区域元素起画
+(少掉的节点不再占用 AI 的 token 预算)、**抓取任务**也带同一个区域, 保证界面里预览的规则与
+实际抓取的范围相同。
+
+> 选择器写错时**不会静默生效**: 界面会明确提示"没有匹配到元素, 已按整页分析", 报告里也有
+> `scope_matched` 标记。选对了则回显区域选择器与规模, 便于确认"选中的是哪一块"。
+
 ## 核心能力
 
 | 模块 | 文件 | 说明 |
 |---|---|---|
 | 浏览器自动化 | `browser.py` | Chromium/Firefox/WebKit、无头可配、模拟交互、多标签页、iframe、信号量并发、会话持久化 |
 | 网络监听 | `network.py` | 捕获 xhr/fetch/websocket、JSON 解析、耗时统计、JSONL 落盘、按正则/MIME/状态码查询 |
-| 结构分析 | `structure.py` | 重复结构识别、唯一选择器生成(id > data-* > 稳定 class)、分页识别、JSON-LD/OG/Microdata |
+| 结构分析 | `structure.py` | 重复结构识别、唯一选择器生成(id > data-* > 稳定 class)、分页识别、JSON-LD/OG/Microdata; 支持**限定抓取区域**(只爬页面的一部分) |
 | AI 辅助 | `ai.py` | 自然语言转规则、API JSON 字段映射、选择器自愈、数据清洗; 兼容 OpenAI 接口(DeepSeek/通义/智谱/Moonshot 等)与本地 Ollama; 响应缓存; 离线降级 |
 | 数据提取 | `extractor.py` | CSS/XPath/JSONPath/正则、清洗管线(strip/price/date/url 等)、Pydantic 校验、去重与增量 |
 | 反爬稳定性 | `anti_spider.py` | 随机 UA 与请求头、代理池(失败剔除与冷却)、随机限速(默认 1~3s)、指数退避重试、指纹伪装注入、robots.txt 合规(默认开启) |

@@ -31,7 +31,28 @@ from smartcrawler.models import DownloadedFile  # noqa: E402
 from smartcrawler.plugins.base import PluginContext  # noqa: E402
 from smartcrawler.plugins.manager import PluginManager  # noqa: E402
 
-PORT = 8971
+def pick_free_port(preferred: int = 8971) -> int:
+    """要一个真的能监听的本地端口。
+
+    **为什么不能硬编码**: 原先固定用 8971, 而那个端口在开发机上可能被别的程序占着。
+    实测撞上过一个游戏进程(Client-Win64-Shipping)正监听 8971 —— 此时本脚本的测试
+    服务器根本绑不上, 客户端拿到的却是那个**陌生服务**, 于是所有请求都以
+    `ReadError: [WinError 10054] 远程主机强迫关闭了一个现有的连接` 收场。
+    现象看起来完全像是下载代码坏了(5 项验收集体失败), 实际与本项目无关。
+    先试首选端口, 被占就交给系统分配一个空闲端口。
+    """
+    import socket  # noqa: PLC0415
+
+    for port in (preferred, 0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return int(s.getsockname()[1])
+            except OSError:
+                continue
+    return 0
+
+
 FIX = PROJ / ".runtmp" / "verify_video"
 OUT = PROJ / "data" / "plugin_output"
 VIDEO_DIR = OUT / "video"
@@ -84,7 +105,10 @@ def serve(directory: Path):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=str(directory), **kw)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Quiet)
+    port = pick_free_port()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Quiet)
+    # 真实端口要回填给调用方 —— 首选端口被占时系统会另分一个, 用常量拼 URL 会指向空处
+    globals()["PORT"] = int(srv.server_address[1])
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 

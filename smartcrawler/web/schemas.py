@@ -16,6 +16,14 @@ class CrawlRequest(BaseModel):
     """POST /api/crawl —— 一次抓取任务的全部可调参数。"""
 
     url: str = Field(description="目标页面 URL")
+    scope: str = Field(
+        default="",
+        description=(
+            "限定分析区域的选择器 —— **只在这个区域内找候选列表并生成规则**, 用于"
+            "\"我只想爬页面的一部分\"。留空表示整页。写法: CSS 选择器(如 "
+            "`div#content`), 或界面里点选元素后回填的选择器。"
+        ),
+    )
     goal: Optional[str] = Field(default=None, description="自然语言抓取目标(启用 AI 时生效)")
     rule: Optional[dict[str, Any] | str] = Field(
         default=None, description="显式提取规则(对象或 JSON 字符串), 优先级高于 goal"
@@ -78,6 +86,14 @@ class AnalyzeRequest(BaseModel):
     """POST /api/analyze —— 页面结构分析。"""
 
     url: str
+    scope: str = Field(
+        default="",
+        description=(
+            "限定分析区域的选择器。—— 只在该区域内找候选列表、只画该区域的结构树。"
+            "用于\"我只想爬页面的一部分\": 页头导航/侧栏推荐/页脚链接不会再混进候选。"
+            "留空 = 整页。选择器没匹配到元素时会按整页分析, 并在报告的 scope_matched 标记。"
+        ),
+    )
     deep_scroll: int = Field(
         default=0,
         ge=0,
