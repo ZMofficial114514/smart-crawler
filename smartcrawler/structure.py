@@ -403,6 +403,13 @@ _ANALYZE_JS = r"""
                     push(nm, sel, null);
                 }
                 push('link', sel, 'href');
+                // 再给一个"文本 + 换行 + 链接"的字段。
+                //
+                // 用户的诉求: 结果表里只显示 URL 时看不出这个链接**原本写着什么**, 而锚文本
+                // 往往才是要的信息(如"圣三一综合学园")。这里作为**附加字段**提供, 不替换
+                // `link` —— 插件是按字段名取地址的(`netease-music` 默认从 `link` 解析
+                // `/song?id=...`), 把 `link` 改成两行文本会连带弄坏下载器。
+                push('link_text', sel, 'text_with_href');
             } else if (sel) {
                 push('link', sel, 'href');
             }

@@ -182,6 +182,27 @@ def _is_transient_error(error: Any) -> bool:
     return bool(_TRANSIENT_RE.search(text))
 
 
+def _url_fragments(raw: str) -> list[str]:
+    """从字段值里挑出所有像 URL/路径的片段。挑不出就返回原值。
+
+    为什么需要: 规则里的 `link` 可能是"锚文本 + 换行 + 链接"的两行式(见 extractor 的
+    ``text_with_href``)。把整段拿去解析歌曲 id 会失败, 但里面明明有可用地址。
+    """
+    text = str(raw or "")
+    found = re.findall(r"https?://[^\s]+|/[A-Za-z0-9_\-./?=&%#]+", text)
+    # 去重并保持顺序; 没有命中就把原值当唯一候选
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in found:
+        f = f.strip()
+        if f and f not in seen:
+            seen.add(f)
+            out.append(f)
+    if not out:
+        out = [text.strip()]
+    return out
+
+
 def _safe_name(text: str, limit: int = 80) -> str:
     """把歌名/歌手变成安全的文件名片段。"""
     text = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (text or "").strip())
@@ -338,7 +359,13 @@ class NeteaseMusicPlugin(BasePlugin):
                     raw = str(int(raw))
                 if not isinstance(raw, str) or not raw.strip():
                     continue
-                sid = _song_id_from_url(absolute_url(ctx.url, raw))
+                # 字段值里可能带着别的文字 —— 规则里 `link` 若是"文本 + 换行 + 链接"两行式
+                # (用户可以在规则里把 attribute 设为 text_with_href), 直接拿去解析 id 会失败。
+                # 这里先从值里挑出第一个像 URL 的片段, 再解析; 挑不出就按原样试。
+                for cand in _url_fragments(raw):
+                    sid = _song_id_from_url(absolute_url(ctx.url, cand))
+                    if sid:
+                        break
                 if not sid and raw.strip().isdigit():
                     sid = raw.strip()
                 if sid:

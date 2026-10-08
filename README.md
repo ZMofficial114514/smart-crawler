@@ -316,6 +316,35 @@ asyncio.run(main())
 3. 规则经 Pydantic 校验后在页面上批量提取。若目标更适合取接口数据, 模型会输出 `mode=json`
    的 JSONPath 规则, 框架改从捕获的 XHR 响应中提取。
 
+### 字段取值:`attribute` 的几种写法
+
+`selector` 定位元素, `attribute` 决定**从它身上取什么**:
+
+| `attribute` | 取值 | 用途 |
+|---|---|---|
+| 不写 / `text` | 元素文本 | 默认 |
+| `href` / `src` / 任意属性名 | 该属性的值 | 链接、图片、懒加载 `data-src` 等 |
+| `html` | 元素内 HTML | 需要保留标签结构时 |
+| **`text_with_href`** | **`锚文本 + 换行 + 链接`** | 只看 URL 时看不出链接原本写着什么 |
+
+`text_with_href` 的实际效果:
+
+```jsonc
+{"name": "link_text", "selector": "a.name", "attribute": "text_with_href"}
+```
+
+```text
+琵琶曲 (DJ筱轩版)
+/play_detail/543882869
+```
+
+没有 `href` 时退化为纯文本, 不会留下空行。
+
+> **它不会替换 `link`。** 结构分析会同时给出 `link`(纯 URL)和 `link_text`(两行式):
+> 插件是按**字段名**取地址的(网易云下载器默认从 `link` 解析 `/song?id=...`), 把 `link`
+> 换成两行文本会连带弄坏下载器。想要两行显示就用 `link_text` 这一列, 或者自己把规则里
+> `link` 的 `attribute` 改成 `text_with_href`。
+
 ## 项目结构
 
 ```

@@ -72,6 +72,19 @@ _EXTRACT_DOM_JS = r"""
         } catch (e) { return null; }
         if (!el) return null;
         if (f.attribute === 'html') return el.innerHTML;
+
+        //: 文本与链接一起取, 中间换行。用户诉求: 抓取结果里 link 这一列只显示 URL 时,
+        //: 看不出这个链接**原本写着什么**(锚文本往往才是真正要的信息, 比如"三一综合学园")。
+        //: 两行放在同一个单元格里, 既保留可点的链接, 又不丢锚文本。
+        //: 没有 href 时退化为纯文本, 不会留一个空行。
+        if (f.attribute === 'text_with_href' || f.attribute === 'text+href') {
+            const txt = (el.textContent || '').trim();
+            const href = (el.getAttribute('href') || '').trim();
+            if (!href) return txt || null;
+            if (!txt) return href;
+            return txt + '\n' + href;
+        }
+
         if (f.attribute && f.attribute !== 'text') {
             const v = el.getAttribute(f.attribute);
             return v === null ? null : v.trim();
