@@ -17,6 +17,7 @@ ENV = ROOT / ".env"
 
 # ---------- 1. 读出真实 key(只用于比对, 不打印完整值) ----------
 real_keys: list[str] = []
+real_key_names: list[str] = []
 if ENV.exists():
     for line in ENV.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.strip()
@@ -26,12 +27,20 @@ if ENV.exists():
         value = value.strip().strip('"').strip("'")
         if value and re.search(r"KEY|TOKEN|SECRET|PASSWORD", key, re.I):
             real_keys.append(value)
+            real_key_names.append(key.strip())
 
 if not real_keys:
     print("  .env 里没有找到密钥类变量")
 else:
-    for k in real_keys:
-        print(f"  发现密钥变量, 长度 {len(k)}, 前 6 位 {k[:6]}…后 4 位 …{k[-4:]}")
+    # 只报"有几个、哪个变量名", **不打印密钥的任何片段**。
+    #
+    # 原先打印"长度 35, 前 6 位 sk-638…后 4 位 …d51a"。虽然是在本机终端、也做了遮蔽,
+    # 但这个脚本每次 push 都会跑 —— 输出会进终端历史、CI 日志、录屏、截图。密钥的前后
+    # 几位配合长度, 对暴力猜测是**有效缩减搜索空间**的信息, 没有任何理由泄露它。
+    # 要确认"是哪一个", 看变量名就够了。
+    print(f"  发现 {len(real_keys)} 个密钥类变量(不打印任何片段):")
+    for name in real_key_names:
+        print(f"      - {name}")
 
 # ---------- 2. 找出会被 git 跟踪的文件 ----------
 SKIP_DIRS = {".venv", ".git", ".browsers", ".runtmp", "__pycache__", "node_modules",
