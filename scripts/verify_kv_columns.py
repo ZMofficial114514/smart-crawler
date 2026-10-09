@@ -91,8 +91,14 @@ async def main() -> int:
         got = [v for v in best_vals if v]
         check(len(got) == len(EXPECT),
               f"**取到全部 {len(EXPECT)} 个值**", f"实际 {len(got)} 个")
-        missing = [e for e in EXPECT if e not in got]
+        # 值可能是两项式(`text_with_href`: 锚文本 + 换行 + 链接), 所以用"包含"判定而不是全等。
+        # 实测"所属组织"那一行是 `<a class="info_value" href="/data/organize/2">圣三一综合学园</a>`,
+        # 取到 `'圣三一综合学园\n/data/organize/2'` 正是想要的效果(锚文本 + 链接), 不是脏数据。
+        missing = [e for e in EXPECT if not any(e in v for v in got)]
         check(not missing, "**8 个期望值全部命中**", f"缺: {missing}")
+        # 每格只能含一个期望值, 否则说明选择器取错了元素(把别的行也算进来了)
+        cross = [v for v in got if sum(1 for e in EXPECT if e in v) > 1]
+        check(not cross, "**没有把多行的值混进同一格**", f"混了: {cross}")
 
         await browser.close()
 

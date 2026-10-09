@@ -316,7 +316,7 @@ _ANALYZE_JS = r"""
     };
 
     // ---- 从样本列表项推断字段 ----
-    const sampleFields = (sample) => {
+    const sampleFields = (sample, items) => {
         const fields = [];
         const used = new Set();
         // 上限放宽到 12: 除了文本字段, 还要给 image / audio / video 留位置 ——
@@ -438,6 +438,153 @@ _ANALYZE_JS = r"""
             const base = cls.length ? cls[0] : (tag === 'a' ? 'text' : tag);
             push(semanticName(target, tt, base), relSelector(sample, target), null);
         });
+
+        // ---- 覆盖度修正: 只在"某些列表项取不到值"时才触发 ----
+        //
+        // 采样器只看得到**第 1 行**。站点完全可以在别的行里换标签 —— 实测 kivo.wiki 的角色
+        // 信息行就是这样:
+        //     <div class="info_key">稀有度</div><div class="info_value">★★★</div>
+        //     <div class="info_key">所属组织</div><a class="info_value" href="/data/organize/2">圣三一综合学园</a>
+        // 采样器先撞上那个 `<a>`, 于是生成 `a.n-a.no-underline.info_value`(名字还取自它首个
+        // class `n-a`)—— 这个选择器 8 行里**只有 1 行能命中**, 表格里那一列几乎是空的, 看起来
+        // 像"取不到值", 实际是字段选错了目标。
+        //
+        // **这一步只在覆盖不全时才动, 且只替换那一个字段。** 覆盖满的行(网易云/酷我等)
+        // 一个字节都不会被改到 —— 这是刻意设计的: 我此前把"覆盖度"当成全局排序依据去改
+        // `relSelector`, 结果短选择器 `.text` 胜出、`title` 直接挂掉, link 列从 30/30 掉到
+        // 0/30。教训是**别让新判据去改变本来能工作的路径**。
+        //
+        // **必须用"选择器实际匹配到的全部行", 不能用传进来的 items。** 实测踩过这个坑:
+        // `detectLists` 在分组前会过滤掉"文本不足 10 字且没有链接/图片"的子元素(那本是
+        // 为了排除装饰性容器), kivo.wiki 的 8 行里因此只剩 3 行 —— 于是覆盖度在**错误的
+        // 集合**上验证, "3/3 全覆盖"通过, 真正缺值的 5 行完全没被看见。
+        //
+        // 但"全部行"**只能靠容器限定**, 不能只按 `标签 + class` 找: 那 8 行都是无 class 的
+        // 裸 `<div>`, 而页面上这样的 div 有 346 个 —— 按标签+class 查会得到 346, 覆盖率算出来
+        // 是 17/346, 全是噪声。取样本的父元素, 在它内部找同标签同 class 的兄弟, 才是真正的
+        // "同一个列表的全部行"。
+        let fullSet = null;
+        const allRows = () => {
+            if (fullSet) return fullSet;
+            fullSet = (items && items.length) ? items : [];
+            const parent = sample.parentElement;
+            if (parent) {
+                const tag = sample.tagName;
+                const cls = stableClasses(sample).map(cssEscape).join('.');
+                const sel = tag.toLowerCase() + (cls ? '.' + cls : '');
+                let hits = [];
+                try { hits = Array.from(parent.querySelectorAll(':scope > ' + sel)); }
+                catch (e) { hits = []; }
+                if (hits.indexOf(sample) < 0) hits = [];
+                // 取"更全"的那个: 过滤后的 items 可能少于真实行数
+                if (hits.length > fullSet.length) fullSet = hits;
+            }
+            if (!fullSet.length) fullSet = [sample];
+            return fullSet;
+        };
+
+        if (fields.length) {
+            const coverage = (sel, pool) => {
+                let hit = 0;
+                for (const it of pool) {
+                    try {
+                        if (it.querySelector(sel)) hit++;
+                    } catch (e) { return 0; }
+                }
+                return hit;
+            };
+            const pool = allRows();
+            for (let fi = 0; fi < fields.length; fi++) {
+                const f = fields[fi];
+                const _cov = coverage(f.selector, pool);
+                if (_cov >= pool.length) continue;   // 已全覆盖, 不动
+
+                // 样本里该字段选中的元素(整行查询与逐项查询命中的是同一个)
+                let el = null;
+                try { el = sample.querySelector(f.selector); } catch (e) { continue; }
+                if (!el) continue;
+                const cls = stableClasses(el);
+                if (!cls.length) continue;
+
+                // 候选从"最具体"到"最简", 取**首个覆盖满且逐行唯一**的。
+                //
+                // 用 `:scope` 做前缀而不是裸 class: `:scope > X` 明确表示"这一行**直接子元素**
+                // 里的 X", 避免命中途径中其它子树的同名元素。`:scope` **只支持子/后代组合器** ——
+                // `:scope ~ X` 是不成立的(实测逐行命中全为 0), 所以这里只沿祖先链构造 `>` 路径。
+                const clsSel = cls.map(c => '.' + cssEscape(c)).join('');
+                //: 收标签集合要用**行的直接子元素**, 不能用 `it.querySelector(clsSel)`。
+                //
+                // 这个区别是致命的: kivo.wiki 每一行是 `<div><div class="info_key">…</div>
+                // <div|a class="info_value">…</div></div>`, 而 `querySelector` 只返回**第一个**
+                // 后代 —— 在有 `<a>` 的行上返回 `<a>`, 在只有 div 的行上返回 div, 于是 tags
+                // 集合最多收全, 但只要有一行的首个后代是同一个标签就漏。更关键的是**值那一格
+                // 是直接子元素**, 按"直接子元素 + class"找才与 `:scope > .info_value` 的口径一致。
+                const kidsOf = (it) => Array.from(it.children).filter(
+                    c => stableClasses(c).indexOf(cls[cls.length - 1]) >= 0);
+                const tags = [...new Set(Array.from(pool).map(it => {
+                    const k = kidsOf(it);
+                    return k.length ? k[0].tagName.toLowerCase() : '';
+                }).filter(Boolean))].sort();
+                const head = tags.length >= 2 && tags.length <= 4
+                    ? ':is(' + tags.join(',') + ')' : null;
+
+                // 从 el 往上到 sample 的路径(不含 sample), 用来构造 `:scope > A > B`
+                const chain = [];
+                let cur = el;
+                for (let i = 0; i < 6 && cur && cur !== sample; i++) {
+                    chain.unshift(cur);
+                    cur = cur.parentElement;
+                }
+                const leafForms = [];
+                if (head) leafForms.push(head + clsSel);
+                leafForms.push(clsSel);
+                leafForms.push(el.tagName.toLowerCase() + clsSel);
+                // **只用最后一个 class 的形式也要给。**
+                //
+                // 这是本修正真正起作用的那种候选。实测 kivo.wiki: 目标元素的 class 是
+                // `n-a no-underline info_value`, 而 `n-a` / `no-underline` 是那一行特有的 ——
+                // 按完整组合生成的选择器只能命中 1/8 行。站点通常把**语义类名放在末尾**
+                // (`info_value`), 它才是跨行稳定的那个。没有这一条, 候选里就全是带 `n-a` 的
+                // 组合, 覆盖率永远上不去, 修正看着"跑了但没用"。
+                const lastCls = '.' + cssEscape(cls[cls.length - 1]);
+                if (cls.length > 1) {
+                    if (head) leafForms.push(head + lastCls);
+                    leafForms.push(lastCls);
+                    leafForms.push(el.tagName.toLowerCase() + lastCls);
+                }
+                const cands = [];
+                for (let n = 1; n <= chain.length; n++) {
+                    const segs = chain.slice(chain.length - n, chain.length - 1)
+                        .map(x => stableClasses(x).length
+                            ? '.' + cssEscape(stableClasses(x)[0]) : null);
+                    if (segs.some(x => !x)) continue;
+                    for (const lf of leafForms) {
+                        cands.push(':scope > ' + segs.concat([lf]).join(' > '));
+                    }
+                }
+                for (const lf of leafForms) cands.push(lf);
+
+                for (const cand of cands) {
+                    let ok = true, c = 0;
+                    for (const it of pool) {
+                        let n = 0;
+                        try { n = it.querySelectorAll(cand).length; }
+                        catch (e) { ok = false; break; }
+                        if (n === 1) c++;
+                        else if (n > 1) { ok = false; break; }   // 行内不唯一: 会取错元素
+                    }
+                    if (!ok || c < pool.length) continue;
+                    // 命中: 换掉这个字段(名字也换成更可读的 class, 如 n-a -> info_value)
+                    used.delete(f.selector + '|' + (f.attribute || ''));
+                    f.selector = cand;
+                    const better = cls[cls.length - 1];
+                    if (better && !looksGenerated(better)) f.name = better;
+                    used.add(cand + '|' + (f.attribute || ''));
+                    break;
+                }
+            }
+        }
+
         return dropRedundantFields(sample, fields);
     };
 
@@ -535,7 +682,7 @@ _ANALYZE_JS = r"""
                     item_selector: itemSel,
                     container_selector: parentSel,
                     count: hits,
-                    sample_fields: sampleFields(arr[0]),
+                    sample_fields: sampleFields(arr[0], arr),
                     sample_html: arr[0].outerHTML.slice(0, 2000),
                 };
             }
@@ -660,7 +807,7 @@ _ANALYZE_JS = r"""
                     item_selector: itemSel,
                     container_selector: parentSel,
                     count: hits,
-                    sample_fields: sampleFields(arr[0]),
+                    sample_fields: sampleFields(arr[0], arr),
                     sample_html: arr[0].outerHTML.slice(0, 2000)
                 });
             }
@@ -730,7 +877,7 @@ _ANALYZE_JS = r"""
                     item_selector: picked.sel,
                     container_selector: parentSel,
                     count: picked.got.length,
-                    sample_fields: sampleFields(picked.got[0]),
+                    sample_fields: sampleFields(picked.got[0], picked.got),
                     sample_html: picked.got[0].outerHTML.slice(0, 2000)
                 });
             }

@@ -77,7 +77,12 @@ async def main() -> int:
         await crawler.close()
 
     print(f"  条数: {result.item_count} | 耗时: {result.duration_ms:.0f}ms")
-    check(result.item_count == 0, "确实拿不到数据(符合预期)")
+    # **不能用 `== 0`**: 这个页面时好时坏 —— 有时返回 HTTP 401 错误页(0 条), 有时又会返回
+    # 一点内容(实测同一份代码跑出过 0 条 / 1 条 / 7 条)。它是**外部站点的状态**, 不是本框架
+    # 的行为, 写死 0 会让这条用例随机翻红。真正要守住的是"受权限限制时不该产出**成规模的**
+    # 数据", 所以用阈值判定 —— 这也与本用例的主目的(诊断是否给出 permission_denied)一致。
+    check(result.item_count < 20,
+          f"受权限限制, 未产出成规模数据(实得 {result.item_count} 条)")
     issue = result.access_issue
     check(issue is not None, "抓取结果带上了诊断")
     if issue is None:
