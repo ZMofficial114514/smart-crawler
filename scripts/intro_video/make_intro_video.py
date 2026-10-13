@@ -27,53 +27,91 @@ from PIL import Image, ImageDraw, ImageFilter
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 
+import demo_kit as DK  # noqa: E402
 import render_kit as rk  # noqa: E402
 import scenes as SC  # noqa: E402
+import scenes_easy as SE  # noqa: E402
 import scenes_extra as SX  # noqa: E402
 
 PROJ = HERE.parent.parent
 FFMPEG = PROJ / "tools" / "ffmpeg" / "ffmpeg.exe"
 
-#: 每场景的额外停留时间(秒)。场景表里的 dur 已经包含正文动画, 这里再加"看完字幕"的时间。
-#: 调这个值就能整体拉长/压缩成片 —— 18 个场景 x 此值 = 总增加量。
-HOLD = 2.4
+#: 每场景的额外停留时间(秒)。场景表里的 dur 已经包含正文动画, 这里再加"看字幕"的时间。
+#: 调这个值就能整体拉长/压缩成片。
+#:
+#: 从 2.4 收到 1.7: 观众反馈"略显磨叽"。1.7 秒够看完一行字幕, 又不至于让画面停在那儿干等。
+HOLD = 1.7
+
+#: 明确要"松一点"的场景(封面与结尾值得多停一拍; 技术细节段可以更快)
+HOLD_EXTRA = {"title": 1.2, "end": 1.0, "flow": -0.4, "quality": -0.4,
+              "plugins": -0.3, "masonry": -0.3}
 
 
 def build_all() -> list[rk.Scene]:
-    """场景表 + 补时。顺序即成片顺序。"""
-    base = SC.build_scenes()
-    # 把补充场景插进合适的位置: 结构分析之后讲 iframe/选择器/瀑布流, 控制台之后讲抓包
-    order_keys = [s.key for s in base]
-    extra = [
-        SX.scene_iframe, SX.scene_selector, SX.scene_sniff, SX.scene_masonry,
-        SX.scene_quality,
+    """按**显式顺序**拼出完整场景表, 再做补时。
+
+    顺序按观众的理解曲线排, 不按模块清单:
+      问题 -> 说人话解释是什么 -> 能干什么 -> 怎么做(架构/细节) -> 用起来什么样
+      -> 边界与合规 -> 三步上手
+
+    早先这函数是"遍历基础表, 遇到某个 key 就 append 一个补充场景"。那种写法有个坑:
+    **新 append 的场景自己不会被再遍历到**, 于是挂在它后面的插入条件永远不触发 ——
+    `why` 与 `boundary` 就这样静默丢了(总时长只差几秒, 不看顺序表根本发现不了)。
+    改成显式列表后, 顺序一眼可读, 名字写错也会当场 KeyError。
+    """
+    base = {s.key: s for s in SC.build_scenes()}
+
+    def take(key: str) -> rk.Scene:
+        if key not in base:
+            raise KeyError(f"场景表里没有 {key!r} —— 拼顺序时名字写错了"
+                           f"(现有: {sorted(base)})")
+        return base[key]
+
+    seq: list[rk.Scene] = [
+        # --- 开场: 先建立"这东西对我有什么用" ---
+        take("title"),
+        take("pain"),
+        rk.Scene("whatis", 11.0, SE.scene_whatis,
+                 "把网页上要的内容, 自动搬进表格", 3.6, "说人话"),
+        rk.Scene("why", 10.2, SE.scene_why,
+                 "比价 / 收资料 / 归档收藏 / 盯变化", 3.8, "用途"),
+        # --- 怎么做到: 架构与关键机制 ---
+        take("pillars"),
+        rk.Scene("iframe", 11.4, SX.scene_iframe,
+                 "分析与提取必须在同一个 frame 上", 4.6, "IFRAME"),
+        take("flow"),
+        # --- 用起来什么样: 控制台与抓包 ---
+        take("console"),
+        rk.Scene("sniff", 11.0, SX.scene_sniff,
+                 "捕获 XHR/fetch/WebSocket 并解析 JSON", 3.8, "网络抓包"),
+        # --- 具体能力 ---
+        take("ai"),
+        rk.Scene("selector", 11.4, SX.scene_selector,
+                 "覆盖不全才替换, 覆盖满就不动手", 4.8, "选择器"),
+        take("scope"),
+        rk.Scene("masonry", 10.4, SX.scene_masonry,
+                 "并集可被一个更宽的选择器选中, 那就合并", 3.6, "瀑布流"),
+        take("media"),
+        take("plugins"),
+        # --- 工程可信度 ---
+        take("robust"),
+        rk.Scene("quality", 11.0, SX.scene_quality,
+                 "49 个脚本: 43 个 verify + 6 个 check", 4.6, "验收"),
+        # --- 边界与合规(诚实交代, 对宣传反而加分) ---
+        rk.Scene("boundary", 10.4, SE.scene_boundary,
+                 "robots / 限速 / 付费内容 —— 都不绕过", 3.6, "边界"),
+        take("compliance"),
+        # --- 收尾: 说人话的上手步骤, 再给技术版快速开始 ---
+        rk.Scene("steps", 10.6, SE.scene_steps,
+                 "会打字就能用", 3.4, "上手"),
+        take("start"),
+        take("end"),
     ]
-    out: list[rk.Scene] = []
-    for s in base:
-        out.append(s)
-        if s.key == "pillars":
-            out.append(rk.Scene("iframe", 12.4, SX.scene_iframe,
-                                "分析与提取必须在同一个 frame 上", 5.2, "IFRAME"))
-        if s.key == "ai":
-            out.append(rk.Scene("selector", 12.4, SX.scene_selector,
-                                "覆盖不全才替换, 覆盖满就不动手", 5.4, "选择器"))
-        if s.key == "console":
-            out.append(rk.Scene("sniff", 12.0, SX.scene_sniff,
-                                "捕获 XHR/fetch/WebSocket 并解析 JSON", 4.4, "网络抓包"))
-        if s.key == "scope":
-            out.append(rk.Scene("masonry", 11.2, SX.scene_masonry,
-                                "并集可被一个更宽的选择器选中, 那就合并", 4.2, "瀑布流"))
-        if s.key == "robust":
-            out.append(rk.Scene("quality", 12.0, SX.scene_quality,
-                                "49 个脚本: 43 个 verify + 6 个 check", 5.4, "验收"))
-    assert order_keys, "场景表为空"
-    for s in out:
-        # design 记下"动画本来多长" —— 绘制函数里的绝对时刻都是按它写的。
-        # dur 再补上 HOLD, 让观众有时间看完字幕。
+    for s in seq:
         if not s.design:
             s.design = s.dur
-        s.dur += HOLD
-    return out
+        s.dur += HOLD + HOLD_EXTRA.get(s.key, 0.0)
+    return seq
 
 
 def inject_time(sc: rk.Scene) -> float:
@@ -85,10 +123,9 @@ def inject_time(sc: rk.Scene) -> float:
     """
     k = (sc.dur / sc.design) if sc.design else 1.0
     rk.set_design(sc.design or sc.dur, sc.dur)
-    SC.DUR = sc.dur
-    SX.DUR = sc.dur
-    SC.K = k
-    SX.K = k
+    for mod in (SC, SX, SE):
+        mod.DUR = sc.dur
+        mod.K = k
     return k
 
 
@@ -174,12 +211,17 @@ def make_music(dur: float) -> np.ndarray:
 # 渲染
 # ---------------------------------------------------------------------------
 def render(out_path: pathlib.Path, fps: int, size: tuple[int, int],
-           with_audio: bool = True) -> int:
+           with_audio: bool = True, keep: list[str] | None = None) -> int:
     # 尺寸必须在场景模块 import **之前**设定 —— 它们用 `from render_kit import W, H`,
     # 会把当时的值绑进自己的命名空间。render_kit.set_size 会清掉背景缓存。
     rk.set_size(*size)
     rk.assert_size_matches(*size)
     scenes = build_all()
+    if keep:
+        scenes = [s for s in scenes if s.key in keep]
+        if not scenes:
+            print(f"  --scenes 没匹配到任何场景")
+            return 2
     total = sum(s.dur for s in scenes)
     nframes = int(total * fps)
 
@@ -196,7 +238,9 @@ def render(out_path: pathlib.Path, fps: int, size: tuple[int, int],
         "-s", f"{size[0]}x{size[1]}", "-r", str(fps), "-i", "pipe:0",
     ]
     if with_audio:
-        wav = HERE / "_music.wav"
+        # 中间产物统一放 .runtmp/(已被 .gitignore 排除), 别散在 scripts/ 里 ——
+        # 之前就因为这个, git status 里冒出过 14MB 的 mp4 和 5.7MB 的 wav 等着被误提交。
+        wav = DK.ensure_workdir() / "music.wav"
         write_wav(wav, make_music(total))
         cmd += ["-i", str(wav)]
     cmd += [
@@ -283,6 +327,9 @@ def main() -> int:
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--size", default="1920x1080")
     ap.add_argument("--no-audio", action="store_true")
+    ap.add_argument("--scenes", default="",
+                    help="只渲染这些场景, 逗号分隔的段(如 'title:sniff' 或 "
+                         "'boundary,end'), 便于把介绍片拆成片头/片尾夹住演示片段")
     ap.add_argument("--frames-only", nargs=2, type=int, metavar=("A", "B"),
                     help="只导出第 A..B 帧为 PNG(调试用, 不调用 ffmpeg)")
     args = ap.parse_args()
@@ -297,7 +344,52 @@ def main() -> int:
     if not FFMPEG.exists():
         print(f"  找不到 ffmpeg: {FFMPEG}")
         return 1
-    return render(out, args.fps, (w, h), with_audio=not args.no_audio)
+    try:
+        keep = parse_scene_filter(args.scenes)
+    except (KeyError, ValueError) as exc:
+        print(f"  --scenes 参数有问题: {exc}")
+        return 2
+    return render(out, args.fps, (w, h), with_audio=not args.no_audio,
+                  keep=keep)
+
+
+def parse_scene_filter(spec: str) -> list[str] | None:
+    """把 ``--scenes`` 解析成要保留的 key 列表; 空串返回 None(表示全部)。
+
+    支持两种写法, 可混用逗号分隔:
+      - 单个 key:  ``title``
+      - 闭区间:    ``title:sniff``  —— 按 build_all 的实际顺序取这一段(含两端)
+
+    存在的意义: 用户要把演示录屏夹在介绍片**中间**, 那就需要把介绍片拆成"片头"和"片尾"
+    两次渲染。用区间写法比手敲二十几个 key 靠谱得多。
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    order = [s.key for s in build_all()]
+    picked: list[str] = []
+    for raw in spec.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if ":" in part:
+            a, _, b = part.partition(":")
+            a, b = a.strip(), b.strip()
+            for name in (a, b):
+                if name not in order:
+                    raise KeyError(f"没有场景 {name!r}(现有: {order})")
+            i, j = order.index(a), order.index(b)
+            if i > j:
+                raise ValueError(f"区间起点 {a!r} 在终点 {b!r} 之后")
+            picked.extend(order[i:j + 1])
+        else:
+            if part not in order:
+                raise KeyError(f"没有场景 {part!r}(现有: {order})")
+            picked.append(part)
+    # 去重但保持顺序
+    seen: set[str] = set()
+    out = [k for k in picked if not (k in seen or seen.add(k))]
+    return out
 
 
 def dump_frames(outdir: pathlib.Path, size: tuple[int, int], a: int, b: int) -> int:

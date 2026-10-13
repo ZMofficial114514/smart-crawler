@@ -57,10 +57,10 @@ def literals_in(node: ast.AST) -> list[str]:
 
 
 def main() -> int:
-    print("  扫描 scenes.py / scenes_extra.py 里所有写死的文案…")
+    print("  扫描 scenes.py / scenes_extra.py / scenes_easy.py 里所有写死的文案…")
     problems: list[str] = []
     checked = 0
-    for name in ("scenes.py", "scenes_extra.py"):
+    for name in ("scenes.py", "scenes_extra.py", "scenes_easy.py"):
         p = HERE / name
         tree = ast.parse(p.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -89,7 +89,7 @@ def main() -> int:
                         break
 
     # 列表/元组里的文案(如 cards = [("名称", "说明")])也要查 —— 上面那遍只覆盖直接字面量
-    for name in ("scenes.py", "scenes_extra.py"):
+    for name in ("scenes.py", "scenes_extra.py", "scenes_easy.py"):
         p = HERE / name
         src = p.read_text(encoding="utf-8")
         tree = ast.parse(src)

@@ -24,6 +24,7 @@ for _s in (sys.stdout, sys.stderr):
 
 import render_kit as rk  # noqa: E402
 import scenes  # noqa: E402
+import scenes_easy
 import scenes_extra  # noqa: E402
 import make_intro_video as M  # noqa: E402
 
@@ -46,7 +47,7 @@ def main() -> int:
 
     print("\n=== 1) 画布尺寸一致性 ===")
     sz = (rk.W, rk.H)
-    for mod in (scenes, scenes_extra):
+    for mod in (scenes, scenes_extra, scenes_easy):
         same = (getattr(mod, "W", None), getattr(mod, "H", None)) == sz
         check(same, f"{mod.__name__} 绑定的尺寸与 render_kit 一致",
               f"{getattr(mod, 'W', '?')}x{getattr(mod, 'H', '?')} vs {sz[0]}x{sz[1]}")
