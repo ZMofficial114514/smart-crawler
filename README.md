@@ -384,7 +384,7 @@ SmartCrawler/
 │           └── js/              main/router/store/api/ws/utils + ui/ + pages/
 ├── plugins/
 │   └── example_enrich.py        ← 用户插件目录(示例/模板)
-├── scripts/                     共 49 个脚本, 下表为常用项(完整清单见「测试与验收」)
+├── scripts/                     共 71 个脚本, 下表为常用项(完整清单见「测试与验收」)
 │   ├── launcher.py              启动器主逻辑(环境自检 + 启动, 中文输出)
 │   ├── bootstrap_browsers.py    浏览器内核下载(进度/续传/重试)
 │   ├── ai_configure.py          AI 配置与连通性测试

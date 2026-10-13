@@ -77,8 +77,16 @@ _EXTRACT_DOM_JS = r"""
         //: 看不出这个链接**原本写着什么**(锚文本往往才是真正要的信息, 比如"三一综合学园")。
         //: 两行放在同一个单元格里, 既保留可点的链接, 又不丢锚文本。
         //: 没有 href 时退化为纯文本, 不会留一个空行。
+        //:
+        //: 取文本用 ``innerText`` 而**不是** ``textContent``: 后者会把 CSS 隐藏的子元素也算进去。
+        //: 实测网易云歌曲行的 ``<a>`` 里有一个 ``display:none`` 的 span(内容形如
+        //: ``/song?id=34723470``), 用 textContent 取出来就变成
+        //: ``"东京不太热\\n/song?id=34723470\\nhttps://music.163.com/song?id=34723470"`` ——
+        //: 三行, 中间那行是只给搜索引擎看的残迹。innerText 会跳过不可见节点。
+        //: 若 innerText 因环境原因取不到(返回空), 再退回 textContent, 保证不会变成空值。
         if (f.attribute === 'text_with_href' || f.attribute === 'text+href') {
-            const txt = (el.textContent || '').trim();
+            let txt = (el.innerText || '').trim();
+            if (!txt) txt = (el.textContent || '').trim();
             const href = (el.getAttribute('href') || '').trim();
             if (!href) return txt || null;
             if (!txt) return href;
@@ -89,7 +97,15 @@ _EXTRACT_DOM_JS = r"""
             const v = el.getAttribute(f.attribute);
             return v === null ? null : v.trim();
         }
-        return (el.textContent || '').trim();
+        //: 纯文本同样要用 innerText —— 理由与上面 text_with_href 一致。
+        //: 实测网易云: 歌曲行的 ``<a class="txt">`` 里有个 ``display:none`` 的 span,
+        //: 用 textContent 取会让 song_name 变成 ``"东京不太热/song?id=34723470"``,
+        //: 把只给搜索引擎看的路径残迹粘在了歌名后面。
+        {
+            const t = (el.innerText || '').trim();
+            if (t) return t;
+            return (el.textContent || '').trim();
+        }
     };
 
     let itemEls;
