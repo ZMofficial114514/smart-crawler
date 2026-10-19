@@ -225,13 +225,28 @@ def resolve_limit(
     ``dedicated_keys``: 该插件自己的上限配置键(如音频用 ``max_audio``)。放在通用键之前,
     以免用户填了专用项却被通用项顶掉。
     """
+    return resolve_limit_with_source(
+        ctx, plugin_default, dedicated_keys=dedicated_keys
+    )[0]
+
+
+def resolve_limit_with_source(
+    ctx: Any, plugin_default: int, *, dedicated_keys: tuple[str, ...] = ()
+) -> tuple[int, str]:
+    """``resolve_limit`` 的带来源版本, 返回 ``(上限, 来源说明)``。
+
+    **为什么需要来源**: 上限被静默截断是最难排查的一类"故障"。实测用户报了
+    "列表有 30 首、实际只下 20 首" —— 上限来自插件配置里的 ``max_audio: 20``,
+    而界面上没有任何地方看得出这件事, 只能靠人猜。有了来源就能直接告诉用户:
+    "共 30 首, 按上限下载 20 首(上限 20, 来源: 插件配置 max_audio)"。
+    """
     data = getattr(ctx, "data", None) or {}
     task_limit = data.get(MEDIA_LIMIT_KEY)
     if task_limit is not None:
         try:
             value = int(task_limit)
             if value > 0:
-                return value
+                return value, "任务参数(下载数量)"
         except (TypeError, ValueError):
             pass
 
@@ -246,10 +261,10 @@ def resolve_limit(
             try:
                 value = int(config[key])
                 if value > 0:
-                    return value
+                    return value, f"插件配置 {key}"
             except (TypeError, ValueError):
                 continue
-    return plugin_default
+    return plugin_default, "内置默认"
 
 
 #: 从自然语言目标里认出"数量"的表达(中文/英文)。
@@ -322,6 +337,7 @@ __all__ = [
     "build_rules",
     "to_original",
     "resolve_limit",
+    "resolve_limit_with_source",
     "parse_count_from_goal",
     "MEDIA_LIMIT_KEY",
 ]

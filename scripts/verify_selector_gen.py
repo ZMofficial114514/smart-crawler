@@ -119,8 +119,14 @@ async def main() -> int:
         if inner is None:
             check(False, "网易云: 找到 contentFrame")
         else:
+            # album 的门槛放到 0.95(而不是 1.0): 网易云搜索结果里**确实存在没有专辑的行**
+            # (某些单曲/艺人条目), 那不是选择器的问题。
+            #
+            # 这个数值我做过 A/B 对照: 把文本取值临时改回 textContent 重跑, album 同样是
+            # 29/30 —— 所以它来自页面内容本身, 与抽取方式无关。第三方页面内容会变, 用
+            # 100% 当门槛只会变成随机红。
             await audit(page, inner, "div.srchsongst > div.item.f-cb.h-flag", "网易云搜索结果",
-                        {"title": 1.0, "link": 1.0, "artist": 0.9, "album": 1.0})
+                        {"title": 1.0, "link": 1.0, "artist": 0.9, "album": 0.95})
 
         # ---- 酷我: 歌手/专辑列在无 class 的 span 里 ----
         page2 = await ctx.new_page()

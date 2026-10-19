@@ -1411,6 +1411,7 @@ class StructureAnalyzer:
     async def _wait_for_frames_to_settle(
         page: Page, *, timeout: float = 8.0, interval: float = 0.5,
         stable_rounds: int = 3, growth_floor: int = 400,
+        content_timeout: float = 25.0,
     ) -> bool:
         """等内容真正到位。返回是否"看起来已经稳定"。
 
@@ -1418,29 +1419,48 @@ class StructureAnalyzer:
 
         判据(按优先级):
           1. iframe 文档还在 ``readyState === 'loading'`` -> 必须继续等;
-          2. 最丰富的那个 frame 元素数曾经超过 ``growth_floor``(实测网易云内容 frame 约
+          2. **存在"内容位": 命名(或有真实 src)的同源 iframe, 元素数却不足 50**
+             -> 外壳已加载、内容还没注入, 必须继续等(可等到 ``content_timeout``);
+          3. 最丰富的那个 frame 元素数曾经超过 ``growth_floor``(实测网易云内容 frame 约
              950) -> 说明这页确实会长起来, 之后连续 ``stable_rounds`` 次不变即可开始分析;
-          3. 元素数一直低于 ``growth_floor`` -> 这是最难的一种, **无法用绝对大小区分
+          4. 元素数一直低于 ``growth_floor`` -> 这是最难的一种, **无法用绝对大小区分
              "页面本来就小"与"还没加载完"**(实测网易云外壳 336 个元素, 本地小靶站整页
              只有 126 个, 任何固定阈值都会误判一边)。折中办法是给一个**较短的观察窗口**:
              先看 ``observe`` 秒内有没有增长 —— 有增长就说明还会长, 继续等到超时;
              完全没动过就认为"本来就小", 提前返回, 不让小页面白等满 8 秒。
+
+        **第 2 条是后来补的, 因为不加它时第 4 条会把"内容晚到"误判成"页面本来就小"。**
+        实测故障: 网易云内容 frame 加载成空壳后停在 39 个元素, 而外壳有 288 个 ——
+        ``richest``(取各 frame 最大值)是 288, 一直不变, 于是 2 秒就认定"稳定了",
+        提前放弃; 判为不完整后重载, 重载又把内层页面的定时器重置, 于是两次加起来
+        2.4 秒就彻底放弃, 结构分析显示为空。而真实内容在 18 秒后才注入。
+
+        关键点: 判"稳定"时看的是**最丰富的 frame**, 而"内容没注入"的症状是
+        **某个 frame 明显偏小但本该有内容** —— 这两者用同一个指标是看不出来的,
+        必须单独识别"内容位"。
         """
         import asyncio as _asyncio
 
         probe = """() => {
             const out = [document.querySelectorAll('*').length];
             let loading = 0;
+            let pending = 0;
             for (const f of document.querySelectorAll('iframe')) {
                 try {
                     const d = f.contentDocument;
-                    if (d) {
-                        out.push(d.querySelectorAll('*').length);
-                        if (d.readyState === 'loading') loading++;
-                    }
+                    if (!d) continue;
+                    const n = d.querySelectorAll('*').length;
+                    out.push(n);
+                    if (d.readyState === 'loading') { loading++; continue; }
+                    // "内容位": 命名或有真实 src 的同源 iframe, 却几乎是空的。
+                    // 无 name 且 src 为 about:blank 的是站点的临时/工具 frame, 不算。
+                    const named = !!(f.getAttribute('name') || '').trim();
+                    const src = f.getAttribute('src') || '';
+                    const realSrc = src && src !== 'about:blank';
+                    if ((named || realSrc) && n < 50) pending++;
                 } catch (e) { /* 跨域 iframe 读不到, 忽略 */ }
             }
-            return { counts: out, loading: loading };
+            return { counts: out, loading: loading, pending: pending };
         }"""
         try:
             probe0 = await page.evaluate(probe)
@@ -1452,21 +1472,24 @@ class StructureAnalyzer:
         observe = 2.0  # 小页面的观察窗口
         try:
             t0 = _asyncio.get_event_loop().time()
-            deadline = t0 + max(0.0, timeout)
+            # 普通情况按 timeout 收工; 只有在"有内容位还没填"时才允许等更久。
+            soft_deadline = t0 + max(0.0, timeout)
+            hard_deadline = t0 + max(float(timeout), float(content_timeout))
             last_max = -1
             peak = -1
             stable = 0
             while True:
                 now = _asyncio.get_event_loop().time()
-                if now >= deadline:
+                if now >= hard_deadline:
                     return False
                 try:
                     pr = await page.evaluate(probe)
                     counts = pr.get("counts") or []
                     loading = int(pr.get("loading") or 0)
+                    pending = int(pr.get("pending") or 0)
                     richest = max(counts) if counts else -1
                 except Exception:  # noqa: BLE001
-                    richest, loading = -1, 0
+                    richest, loading, pending = -1, 0, 0
                 peak = max(peak, richest)
                 stable = stable + 1 if richest == last_max else 0
                 last_max = richest
@@ -1474,8 +1497,14 @@ class StructureAnalyzer:
                 # iframe 还在加载 -> 一律继续等
                 if loading:
                     stable = 0
+                # 内容位还没注入 -> 继续等, 但不能无限等
+                elif pending:
+                    stable = 0
                 elif stable >= stable_rounds and (big or now - t0 >= observe):
                     return True
+                # 没有"内容位"要等时, 到普通超时就收工 —— 别让普通站点白等
+                if not loading and not pending and now >= soft_deadline:
+                    return False
                 await _asyncio.sleep(interval)
         except Exception as exc:  # noqa: BLE001 - 等待失败不该影响分析
             logger.debug(f"等待 frame 稳定时出错(忽略): {exc}")

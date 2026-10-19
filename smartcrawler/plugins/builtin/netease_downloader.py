@@ -48,6 +48,7 @@ from ._media_stream import (
     resolve_renamed,
     verify_media_file,
 )
+from ._media_transform import resolve_limit_with_source
 
 #: 音频场景的容器 -> 扩展名(mp3 容器落 .mp3, mp4 容器落 .m4a)
 _AUDIO_EXT: dict[str, str] = {
@@ -516,14 +517,25 @@ class NeteaseMusicPlugin(BasePlugin):
             ctx.notify("DEBUG", "网易云下载器: 记录里没有歌曲链接(需要 /song?id=... 形态的字段)")
             return items
 
-        limit = min(len(song_ids), int(ctx.config.get("max_audio") or 20))
-        task_limit = (getattr(ctx, "data", None) or {}).get("media_limit")
-        if task_limit:
-            try:
-                limit = min(limit, int(task_limit))
-            except (TypeError, ValueError):
-                pass
+        # 下载数量: 走**统一的上限解析**, 优先级 任务参数 > 插件专用配置 > 通用配置 > 内置默认。
+        #
+        # 这里原先写的是 `min(插件 max_audio, 任务 media_limit)` —— 结果插件配置的 20
+        # 永远压着任务里的 50, 用户看到"共 30 首、默认数量 50", 实际只下 20 首。
+        # 任务参数代表**本次任务**的意图, 不该被插件的长期配置反向覆盖(同类 bug 在
+        # 图片下载器上已经修过一次, 见 resolve_limit 的注释)。
+        total = len(song_ids)
+        limit, limit_src = resolve_limit_with_source(
+            ctx, 20, dedicated_keys=("max_audio",)
+        )
         song_ids = song_ids[:limit]
+        # 被截断时**必须说出来**, 并且交代上限来自哪里 —— 静默截断是最难排查的:
+        # 用户只会看到"列表 30 首、下来 20 首", 完全无法判断是抓漏了还是被上限卡了。
+        if total > len(song_ids):
+            ctx.notify(
+                "INFO",
+                f"网易云下载器: 共 {total} 首, 按上限下载 {len(song_ids)} 首"
+                f"(上限 {limit}, 来源: {limit_src})",
+            )
 
         session_file = Path(str(ctx.config.get("session_file") or "data/session.json"))
         jar = _cookies_from_storage_state(session_file)

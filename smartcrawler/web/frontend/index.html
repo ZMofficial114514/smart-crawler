@@ -264,14 +264,16 @@
 
                   <!--
                     下载数量: 图片下载器与音频下载器共用这个上限。
-                    留空时后端会先从「抓取目标」里解析数量(如"爬取前三张"), 再退回插件自身配置。
+                    留空时后端会先从「抓取目标」里解析数量(如"爬取前三张"), 再退回插件自身配置
+                    —— 插件配置里可能是个较小的值(实测网易云插件的 max_audio 是 20), 所以
+                    提示里必须写清"还会退回插件配置", 否则用户会以为留空就是不限。
                   -->
                   <div class="field-grid">
                     <div class="field">
                       <label for="crawlMediaLimit">下载数量上限</label>
                       <input type="number" id="crawlMediaLimit" name="media_limit" min="1" max="5000"
-                             placeholder="留空用目标里的数量" />
-                      <p class="hint">最多下载几张图片 / 几个音频</p>
+                             placeholder="留空 = 目标里的数量, 再退回插件配置" />
+                      <p class="hint">最多下载几张图片 / 几个音频; 想全下就填个够大的数</p>
                     </div>
                     <div class="field">
                       <label>留空时的取值顺序</label>
